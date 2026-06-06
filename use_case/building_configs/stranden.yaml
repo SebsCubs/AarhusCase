@@ -1,0 +1,46 @@
+# Stranden building configuration
+building: stranden
+bms_source: stranden
+# NOTE: Stranden BMS has many '--' null values for Rumtemp — treat BMS zone
+# temperature as unreliable; use ReMoni CSVs as ground truth for indoor temperature.
+
+zones:
+  core:
+    outdoor_exposed: false
+    adjacent_to: [floor0, floor1]
+    nominal_air_flow_kgs: 0.05
+    sensor_slugs: []
+  floor0:
+    outdoor_exposed: true
+    adjacent_to: [core]
+    nominal_air_flow_kgs: 0.08
+    sensor_slugs: []
+  floor1:
+    outdoor_exposed: true
+    adjacent_to: [core]
+    nominal_air_flow_kgs: 0.08
+    sensor_slugs: []
+
+bms_file: "Jettesvej 10AStranden-139965-30.3.2026.xlsx"
+
+varme_meter_id: null
+el_meter_id: null
+
+train_start: "2024-12-01"
+train_end: "2025-12-01"
+eval_start: "2026-01-01"
+eval_end: "2026-04-15"
+
+radiator:
+  Q_flow_nominal_sh: 1500.0
+  T_a_nominal_sh: 55.0
+  T_b_nominal_sh: 45.0
+  TAir_nominal_sh: 21.0
+  thermalMassHeatCapacity: 5000.0
+
+heating_curve:
+  s: 1.5
+  b: 35.0
+  delta: 0.0
+  T_min: 20.0
+  T_max: 80.0

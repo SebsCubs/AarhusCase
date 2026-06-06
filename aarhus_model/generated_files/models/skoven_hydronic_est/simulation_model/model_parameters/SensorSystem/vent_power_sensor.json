@@ -1,0 +1,16 @@
+{
+    "parameters": {
+        "use_spreadsheet": false,
+        "use_database": false,
+        "use_df": false
+    },
+    "spreadsheet": {
+        "filename": null,
+        "datecolumn": 0,
+        "valuecolumn": 1
+    },
+    "database": {
+        "uuid": null,
+        "dbconfig": null
+    }
+}

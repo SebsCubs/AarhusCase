@@ -1,0 +1,10 @@
+{
+    "parameters": {
+        "a": [
+            0.5
+        ],
+        "nominalAirFlowRate": [
+            0.05
+        ]
+    }
+}

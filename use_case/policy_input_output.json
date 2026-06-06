@@ -1,0 +1,94 @@
+{
+    "actions": {
+        "ecl310_TSupHea_y": {
+            "scheduleValue": {
+                "signal_key": "scheduleValue",
+                "min": 20,
+                "max": 70,
+                "description": "Building inlet (supply) water temperature setpoint [°C] — the single hydronic control lever (mixing valve target)"
+            }
+        },
+        "room_a_supply_damper": {
+            "damperPosition": {"signal_key": "damperPosition", "min": 0, "max": 1, "description": "Room A AHU supply damper position"}
+        },
+        "room_b_supply_damper": {
+            "damperPosition": {"signal_key": "damperPosition", "min": 0, "max": 1, "description": "Room B AHU supply damper position"}
+        },
+        "room_c_supply_damper": {
+            "damperPosition": {"signal_key": "damperPosition", "min": 0, "max": 1, "description": "Room C AHU supply damper position"}
+        },
+        "room_d_supply_damper": {
+            "damperPosition": {"signal_key": "damperPosition", "min": 0, "max": 1, "description": "Room D AHU supply damper position"}
+        },
+        "supply_air_temp_setpoint_sensor": {
+            "scheduleValue": {"signal_key": "scheduleValue", "min": 16, "max": 24, "description": "AHU supply air temperature setpoint [°C]"}
+        }
+    },
+    "observations": {
+        "outdoor_environment": {
+            "outdoorTemperature": {
+                "signal_key": "outdoorTemperature",
+                "min": -20,
+                "max": 35,
+                "description": "Outdoor air temperature [°C]"
+            }
+        },
+        "ecl310_TSupHea_y": {
+            "scheduleValue": {
+                "signal_key": "scheduleValue",
+                "min": 20,
+                "max": 80,
+                "description": "Building inlet water temperature [°C] (schedule in sim mode)"
+            }
+        },
+        "ecl310_TRetHea_y": {
+            "measuredValue": {
+                "signal_key": "measuredValue",
+                "min": 20,
+                "max": 60,
+                "description": "Return water temperature [°C]"
+            }
+        },
+        "vent_power_sensor": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 0, "max": 2000, "description": "AHU fan power [W]"}
+        },
+        "vent_supply_air_temp_sensor": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 10, "max": 40, "description": "AHU supply air temperature [°C]"}
+        },
+        "room_a_indoor_temp_sensor": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 0, "max": 40, "description": "Room A indoor temperature [°C]"}
+        },
+        "room_b_indoor_temp_sensor": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 0, "max": 40, "description": "Room B indoor temperature [°C]"}
+        },
+        "room_c_indoor_temp_sensor": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 0, "max": 40, "description": "Room C indoor temperature [°C]"}
+        },
+        "room_d_indoor_temp_sensor": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 0, "max": 40, "description": "Room D indoor temperature [°C]"}
+        }
+    },
+    "time_embeddings": {
+        "time_of_day": {"signal_key": "time_of_day", "min": 0, "max": 1},
+        "day_of_week": {"signal_key": "day_of_week", "min": 0, "max": 1},
+        "month_of_year": {"signal_key": "month_of_year", "min": 0, "max": 1}
+    },
+    "forecasts": {
+        "outdoor_temperature": {
+            "outdoor_temperature": {
+                "signal_key": "outdoorTemperature",
+                "min": -20,
+                "max": 35,
+                "description": "Outdoor temperature forecast [°C]"
+            }
+        },
+        "global_irradiation": {
+            "global_irradiation": {
+                "signal_key": "globalIrradiation",
+                "min": 0,
+                "max": 1000,
+                "description": "Clear-sky GHI forecast for Aarhus [W/m²]"
+            }
+        }
+    }
+}

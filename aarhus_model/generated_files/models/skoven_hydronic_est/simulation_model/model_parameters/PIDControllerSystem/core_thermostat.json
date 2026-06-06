@@ -1,0 +1,14 @@
+{
+    "parameters": {
+        "kp": [
+            -1.0
+        ],
+        "Ti": [
+            600.0
+        ],
+        "Td": [
+            0.0
+        ],
+        "isReverse": false
+    }
+}

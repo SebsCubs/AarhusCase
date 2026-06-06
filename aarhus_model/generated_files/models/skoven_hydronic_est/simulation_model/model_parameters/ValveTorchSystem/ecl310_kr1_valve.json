@@ -1,0 +1,10 @@
+{
+    "parameters": {
+        "waterFlowRateMax": [
+            0.5
+        ],
+        "valveAuthority": [
+            0.5
+        ]
+    }
+}

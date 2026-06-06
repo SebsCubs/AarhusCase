@@ -1,0 +1,77 @@
+# Skoven building configuration
+building: skoven
+bms_source: skoven  # uses its own BMS export
+
+# Zones (update once Viben-to-room mapping is confirmed)
+# Currently: 3-zone fallback (core, floor0, floor1)
+# 1-floor building, 4 rooms. Each room is adjacent to two other rooms (a ring)
+# and exposed to the outdoor. Rooms map 1:1 to ReMoni sensors viben8/9/10/11
+# (the metric_sensors_8_9_10_11.csv "Skoven" sensors). Room->sensor assignment
+# is provisional pending the floor plan.
+zones:
+  room_a:
+    outdoor_exposed: true
+    adjacent_to: [room_b, room_d]
+    nominal_air_flow_kgs: 0.05
+    sensor_slugs: ["viben8"]
+  room_b:
+    outdoor_exposed: true
+    adjacent_to: [room_c, room_a]
+    nominal_air_flow_kgs: 0.05
+    sensor_slugs: ["viben9"]
+  room_c:
+    outdoor_exposed: true
+    adjacent_to: [room_d, room_b]
+    nominal_air_flow_kgs: 0.05
+    sensor_slugs: ["viben10"]
+  room_d:
+    outdoor_exposed: true
+    adjacent_to: [room_a, room_c]
+    nominal_air_flow_kgs: 0.05
+    sensor_slugs: ["viben11"]
+
+# BMS file path (relative to repo root Jettesvej2Brabrand/PredictiveOptimalControlAarhus/)
+bms_file: "Jettesvej 10ASkoven-144523-30.3.2026.csv.xlsx"
+
+# Meter assignments — PROVISIONAL (meter_matcher.py best correlation vs Skoven
+# BMS proxy was weak, r=0.31, because BMS is 6-hourly over a spring overlap).
+# Confirm against the building's actual heat/electricity meter IDs.
+varme_meter_id: "5344947"   # provisional: clearest space-heating signature
+                            # (Jan 0.9 kW, ~0 in Apr/May, negative outdoor corr)
+el_meter_id: "19591181"     # provisional (most active EL meter)
+
+# Estimation windows. Stage 1 (envelope) uses a cold window where ReMoni +
+# meters overlap; Stage 2 (hydronic) needs BMS water signals (BMS starts
+# 2025-03-30) so it uses the BMS-meter overlap. Meters end 2025-05-31.
+envelope_start: "2025-01-15"
+envelope_end: "2025-01-22"
+# NOTE: space heating is a winter phenomenon but BMS water signals only begin
+# 2025-03-30, so the hydronic stage runs on the earliest BMS+meter overlap,
+# where heating is already low. Calibration strength is therefore limited.
+# Windows kept to ~1 week so AD-SLSQP estimation is tractable; widen later.
+hydronic_start: "2025-03-31"  # BMS water data begins 2025-03-30 07:00; start a
+hydronic_end: "2025-04-07"    # day later so boundary CSVs have no leading NaN
+# Data export window spanning both stages
+export_start: "2025-01-01"
+export_end: "2025-05-31"
+# RL windows (calibrated-model simulation; not bounded by meter data)
+train_start: "2024-12-01"
+train_end: "2025-12-01"
+eval_start: "2026-01-01"
+eval_end: "2026-04-15"
+
+# Radiator nominal parameters (initial guess; refined by Stage 2)
+radiator:
+  Q_flow_nominal_sh: 1500.0
+  T_a_nominal_sh: 55.0
+  T_b_nominal_sh: 45.0
+  TAir_nominal_sh: 21.0
+  thermalMassHeatCapacity: 5000.0
+
+# ECL310 heating curve initial guess (refined by Stage 2)
+heating_curve:
+  s: 1.5
+  b: 35.0
+  delta: 0.0
+  T_min: 20.0
+  T_max: 80.0
