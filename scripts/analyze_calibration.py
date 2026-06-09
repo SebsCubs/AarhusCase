@@ -36,10 +36,15 @@ TZ = "Europe/Copenhagen"
 _WATER_CSV = "ecl310_TSupHea_y_processed.csv"
 
 
+def _data_start(csv):
+    """First timestamp (UTC) present in a driving CSV."""
+    idx = pd.read_csv(os.path.join(DATA_DIR, csv), index_col=0, parse_dates=True).index
+    return pd.to_datetime(idx, utc=True).min()
+
+
 def _water_data_start():
     """First timestamp (UTC) for which BMS water signals exist."""
-    idx = pd.read_csv(os.path.join(DATA_DIR, _WATER_CSV), index_col=0, parse_dates=True).index
-    return pd.to_datetime(idx, utc=True).min()
+    return _data_start(_WATER_CSV)
 
 
 def _sim_series(model, start, comp, port, step):
@@ -72,6 +77,12 @@ def main():
         help="Which model topology to simulate. 'auto' picks envelope-only when "
              "the window predates the BMS water signals, else the full model.",
     )
+    ap.add_argument(
+        "--warmup-days", type=float, default=0.0,
+        help="Simulate this many days before --start to charge the thermal mass "
+             "(states init at 20 degC), then discard the spin-up before computing "
+             "RMSE/plots. Clamped so the spin-up never precedes the driving data.",
+    )
     args = ap.parse_args()
 
     tz = gettz(TZ)
@@ -83,6 +94,21 @@ def main():
         water_start = _water_data_start()
         stage = "envelope" if pd.Timestamp(end).tz_convert("UTC") <= water_start else "hydronic"
         print(f"auto-selected stage '{stage}' (BMS water data starts {water_start:%Y-%m-%d})")
+
+    # Spin-up: simulate from sim_start (<= start) to charge thermal mass, then
+    # evaluate only on [start, end]. Clamp the spin-up to the earliest driving
+    # data for this stage so the extra steps don't hit out-of-range NaNs.
+    eval_start_utc = pd.Timestamp(start).tz_convert("UTC")
+    eval_end_utc = pd.Timestamp(end).tz_convert("UTC")
+    sim_start = start - datetime.timedelta(days=args.warmup_days)
+    if args.warmup_days > 0:
+        rep_csv = _WATER_CSV if stage == "hydronic" else "outdoor_temperature.csv"
+        data_start = _data_start(rep_csv)
+        if pd.Timestamp(sim_start).tz_convert("UTC") < data_start:
+            sim_start = data_start.tz_convert(tz).to_pydatetime()
+            print(f"warmup clamped to {rep_csv} start {data_start:%Y-%m-%d %H:%M}Z")
+        print(f"spin-up {sim_start:%Y-%m-%d %H:%M} -> eval from {args.start} "
+              f"({(start - sim_start).total_seconds() / 86400:.2f} d discarded)")
 
     # The envelope-only model injects measured heat (available year-round); the
     # full model drives the hydronic loop from the spring-only water sensors.
@@ -102,7 +128,7 @@ def main():
         else:
             print(f"(no {label} pickle — using priors)")
 
-    tb.Simulator(model).simulate(start_time=start, end_time=end, step_size=args.step)
+    tb.Simulator(model).simulate(start_time=sim_start, end_time=end, step_size=args.step)
 
     print(f"\n=== Calibration fit {args.start} -> {args.end} (stage: {stage}) ===")
     print(f"{'signal':28s} {'RMSE':>7} {'sim_mean':>9} {'obs_mean':>9} {'n':>6}")
@@ -111,14 +137,16 @@ def main():
         targets.append(("ecl310_TRetHea_y", "measuredValue", "ecl310_TRetHea_y_processed.csv"))
     series = {}
     for comp, port, csv in targets:
-        sim = _sim_series(model, start, comp, port, args.step)
+        # Sim index starts at sim_start; trim the spin-up to the eval window.
+        sim = _sim_series(model, sim_start, comp, port, args.step).loc[eval_start_utc:eval_end_utc]
         obs = _obs_series(csv)
         r, sm, om, n = _rmse(sim, obs)
         series[comp] = (sim, obs)
         print(f"{comp:28s} {r:7.2f} {sm:9.1f} {om:9.1f} {n:6d}")
 
     if stage == "hydronic":
-        tot = sum(_sim_series(model, start, f"{z}_radiator", "Power", args.step) for z in ZONES)
+        tot = sum(_sim_series(model, sim_start, f"{z}_radiator", "Power", args.step)
+                  for z in ZONES).loc[eval_start_utc:eval_end_utc]
         print(f"\nradiator total power: mean={tot.mean():.0f} W  max={tot.max():.0f} W  "
               f"nonzero={bool(np.any(tot > 1))}")
 
