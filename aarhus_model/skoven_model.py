@@ -2,7 +2,10 @@
 
 Three-stage fcn() pattern (mirrors T4BGymUseCase/boptest_model/5_rooms_model.py):
   - envelope_fcn : zones + outdoor environment + occupancy + ReMoni sensors
-  - hydronic_fcn : ECL310 heating curve → mixing valve → radiators
+  - hydronic_fcn : closed-loop ECL310 mixing-shunt substation → radiators
+                   (PID modulates the primary mixing valve; the secondary supply
+                   temperature is a PRODUCED output, return co-varies via the
+                   recirculation feedback — the only hydronic model)
   - ahu_fcn      : AHU heat recovery + fan + heating coil + per-zone dampers
   - fcn          : master function calling all three
 
@@ -24,6 +27,7 @@ import os
 from typing import Callable, Optional
 
 import twin4build as tb
+import twin4build.utils.constants as t4b_constants
 from twin4build.systems.building_space.building_space_thermal_torch_system import (
     BuildingSpaceThermalTorchSystem,
 )
@@ -53,31 +57,76 @@ TZ = "Europe/Copenhagen"
 
 # 1-floor building, 4 rooms in a ring. Each room is adjacent to two others and
 # exposed to the outdoor. Rooms map 1:1 to ReMoni sensors viben8/9/10/11.
+#
+# Geometry from the Skoven floor plan ("Børnehus 01", floor level GK ~59.96 m).
+# The real building has 22 named rooms (B1.S.01–B1.S.22) totalling 384.0 m² net
+# floor area. We keep the 4 main thermal zones and aggregate the rooms into them
+# by quadrant, each anchored by one of the four large activity rooms; the
+# NW/NE/SE/SW layout matches the adjacency ring below. floor_area_m2 is the
+# summed net area of a zone's constituent rooms; zone air volume = area *
+# ROOM_HEIGHT_M, and C_air = AIR_VOL_HEAT_CAP * volume (see envelope_fcn).
+# The room→zone allocation (esp. the central kitchen/garderoberum) is a modelling
+# choice and can be re-balanced without changing the topology:
+#   room_a (NW): B1.S.16 Grupperum + .17 Toiletrum + .18 Vindfang + .19 Krybberum
+#   room_b (NE): B1.S.07 Grupperum + .08 Toiletrum + .21 Familiestue + .09 Garderobe
+#   room_c (SE): B1.S.01 Værksted/flex + .02 + .03 + .04 + .05 + .06 + .20 + .22
+#   room_d (SW): B1.S.13 Grupperum + .10 Pæd.køkken + .11 Garderobe + .12 + .14 + .15
+ROOM_HEIGHT_M = 3.0            # assumed clear room height [m] (no section drawing)
+AIR_VOL_HEAT_CAP = 1.2 * 1005  # volumetric heat capacity of air ≈ 1206 J/(m³·K)
+
 ZONES = {
     "room_a": {
         "adjacent_to": ["room_b", "room_d"],
         "outdoor_exposed": True,
         "nominal_flow_kgs": 0.05,
+        "floor_area_m2": 83.3,
     },
     "room_b": {
         "adjacent_to": ["room_c", "room_a"],
         "outdoor_exposed": True,
         "nominal_flow_kgs": 0.05,
+        "floor_area_m2": 101.9,
     },
     "room_c": {
         "adjacent_to": ["room_d", "room_b"],
         "outdoor_exposed": True,
         "nominal_flow_kgs": 0.05,
+        "floor_area_m2": 63.0,
     },
     "room_d": {
         "adjacent_to": ["room_a", "room_c"],
         "outdoor_exposed": True,
         "nominal_flow_kgs": 0.05,
+        "floor_area_m2": 135.8,
     },
 }
 
+
+RHO_AIR = 1.2  # air density [kg/m³]
+
+
+def zone_air_capacitance(zone_id: str) -> float:
+    """Volumetric air heat capacity C_air [J/K] for a zone, from its floor area
+    and the assumed room height: C_air = rho*cp * (floor_area * height)."""
+    return AIR_VOL_HEAT_CAP * ZONES[zone_id]["floor_area_m2"] * ROOM_HEIGHT_M
+
+
+def zone_ventilation_flow(zone_id: str, ach: float) -> float:
+    """Design ventilation mass flow [kg/s] for a zone at `ach` air-changes/hour:
+    ach * (floor_area * ROOM_HEIGHT_M) * RHO_AIR / 3600. Used to size the room's
+    VAV damper nominalAirFlowRate (the fully-open flow)."""
+    volume_m3 = ZONES[zone_id]["floor_area_m2"] * ROOM_HEIGHT_M
+    return ach * volume_m3 * RHO_AIR / 3600.0
+
+# Per-radiator nominal rating PRIORS. These set the (non-AD-calibratable) UA via
+# the SpaceHeaterTorchSystem nominal-output solve. They are only the build-time
+# priors: Stage 2 overrides them per-room via compute_winter_sizing() +
+# apply_energy_balance_sizing(), which pin the rating to the measured operating
+# point (T_a/T_b/TAir/Q_flow_nominal) so the radiator output stays consistent with
+# the Stage-1 envelope (which used per-room heat input = district-heat power / 4).
+# See hydronic_param_est.py for why UA is SIZED rather than estimated.
 RADIATOR_DEFAULTS = {
-    "Q_flow_nominal_sh": 1500.0,
+    "Q_flow_nominal_sh": 800.0,
     "T_a_nominal_sh": 55.0,
     "T_b_nominal_sh": 45.0,
     "TAir_nominal_sh": 21.0,
@@ -85,8 +134,36 @@ RADIATOR_DEFAULTS = {
     "nelements": 3,
 }
 
+# Closed-loop ECL310 shunt parameters. The substation is modelled as a mixing
+# shunt: a (roughly constant) hot district-heating primary is blended with
+# recirculated building return water to produce the secondary supply temperature,
+# the mixing ratio being set by the ECL310 PID tracking the outdoor-reset curve.
+# These replace the open-loop "replay the measured supply temperature" boundary.
+# Sizing is mass-consistent and matches the real building's low-flow / high-dT
+# operation (measured supply~51, return~37, dT~14 -> loop flow ~0.05-0.08 kg/s).
+# The primary valve is scaled to the circulation flow (primary_max ~ recirc), so
+# the ECL310 PID has authority to regulate the secondary supply instead of the
+# oversized valve pinning it near the primary temperature. recirc_kgs is kept
+# consistent with the four radiator valves (4 x 0.02 = 0.08 kg/s).
+SHUNT_DEFAULTS = {
+    "T_primary_C": 70.0,        # district-heating primary supply temp [°C] (boundary)
+    "primary_max_kgs": 0.08,    # ECL310 primary valve design flow [kg/s]
+    "recirc_kgs": 0.08,         # recirculation (bypass) flow [kg/s] = 4 * rad flow
+    "pid_kp": 0.05,             # ECL310 PID proportional gain
+    "pid_Ti": 1800.0,           # ECL310 PID integral time [s]
+}
+
+# Ventilation: Danish-regulation 3 air-changes/hour (MVHR). Each VAV damper is
+# sized so that fully open it delivers its room's 3-ACH design mass flow; the AHU
+# heats the heat-recovered outdoor air to the supply set-point. fan_nominal_flow
+# and the heat-recovery flow maxima are sized to the WHOLE-building 3-ACH flow
+# (≈1.15 kg/s for 384 m² × 3 m) so the fan/HR operate in-range; only the AHU
+# ENERGY depends on these (the zone effect is set by the supply-air set-point).
 AHU_DEFAULTS = {
-    "fan_nominal_flow_kgs": 0.5,
+    "ventilation_ach": 3.0,        # air-changes/hour (Danish reg.) per room
+    "supply_air_setpoint_C": 21.0, # sim-mode (RL) supply-air set-point default;
+                                   # calibration mode tracks the room temp (neutral)
+    "fan_nominal_flow_kgs": 1.5,
     "fan_nominal_power_W": 800.0,
     "fan_c1": 0.027828,
     "fan_c2": 0.026583,
@@ -97,8 +174,8 @@ AHU_DEFAULTS = {
     "hr_eps_100_h": 0.70,
     "hr_eps_75_c": 0.65,
     "hr_eps_100_c": 0.60,
-    "hr_primary_max_kgs": 0.5,
-    "hr_secondary_max_kgs": 0.5,
+    "hr_primary_max_kgs": 1.5,
+    "hr_secondary_max_kgs": 1.5,
     "damper_a": 0.5,
 }
 
@@ -142,9 +219,12 @@ def envelope_fcn(self, *, calibration_mode: bool = True,
     )
 
     for zone_id, _cfg in ZONES.items():
+        # C_air scales with the zone's air volume (floor area * ROOM_HEIGHT_M);
+        # the other capacitances/resistances stay as structural priors and are
+        # refined by Stage-1 calibration.
         zone = BuildingSpaceThermalTorchSystem(
             id=zone_id,
-            C_air=1e6,
+            C_air=zone_air_capacitance(zone_id),
             C_wall=5e6,
             C_int=2e5,
             C_boundary=1e6,
@@ -192,71 +272,67 @@ def envelope_fcn(self, *, calibration_mode: bool = True,
 
 
 # ---------------------------------------------------------------------------
-# Hydronic
+# Hydronic — closed-loop mixing-shunt substation (the ONLY hydronic model)
 # ---------------------------------------------------------------------------
 def hydronic_fcn(self, *, calibration_mode: bool = True) -> None:
-    """Building inlet-temperature control + 4 fixed-flow radiators.
+    """Closed-loop ECL310 substation: the secondary supply temperature is an
+    OUTPUT of the model, not a replayed boundary.
 
-    The real system has ONE control lever: a mixing valve (driven by a PID
-    tracking an outdoor-reset heating curve) sets the building inlet water
-    temperature. Each of the 4 rooms has a radiator on a FIXED-opening valve
-    (constant flow), all fed in parallel from the same supply.
+    Structural fix for the open-loop over-determination. A mixing shunt blends a
+    (constant) hot district-heating primary with recirculated building return
+    water; the blend ratio is the ECL310 mixing-valve position, driven by a PID
+    that tracks the outdoor-reset heating curve. The recirculation feedback
+    (return -> supply) couples supply and return so they co-vary with the radiator
+    heat extraction, instead of the supply being pinned to a measured constant.
 
-      calibration_mode=True:
-         BMS Fremløb CSV (leaf SensorSystem) is the supply-water boundary;
-         radiators run with the measured inlet temperature.
+        supply mix : T_sup = (m_p*T_primary + m_r*T_ret) / (m_p + m_r)
+        m_p        : primary flow = ecl310_valve(position = PID output)
+        m_r        : recirculation (bypass) flow [constant]
+        PID        : setpoint = heating curve, feedback = T_sup (the mix output)
 
-      calibration_mode=False:
-         the supply-water setpoint is an RL-controllable schedule (the mixing
-         valve command / heating-curve target).
+    The supply/return cycle mirrors the AHU's existing closed heat-recovery loop,
+    which already simulates in this model, so no new solver machinery is needed.
+
+      calibration_mode=True : the heating-curve setpoint is replayed from the BMS
+        curve CSV and the produced supply/return are scored against the measured
+        BMS Fremloeb/Retur (both are model OUTPUTS now).
+      calibration_mode=False: the curve setpoint is an RL-controllable schedule,
+        so the agent's set-point action propagates valve -> mix -> supply ->
+        radiators -> return -> energy through real loop physics.
     """
-    # ----- Supply-water source (mode-dependent) ------------------------------
-    if calibration_mode:
-        supply_water_source = tb.SensorSystem(
-            id="ecl310_TSupHea_y",
-            filename=_csv("ecl310_TSupHea_y_processed.csv"),
-            
-        )
-        supply_port = "measuredValue"
-    else:
-        supply_water_source = tb.ScheduleSystem(
-            id="ecl310_TSupHea_y",
-            weekDayRulesetDict={
-                "ruleset_default_value": 50.0,
-                "ruleset_start_minute": [0],
-                "ruleset_end_minute": [0],
-                "ruleset_start_hour": [0],
-                "ruleset_end_hour": [24],
-                "ruleset_value": [50.0],
-            },
-            
-        )
-        supply_port = "scheduleValue"
+    sd = SHUNT_DEFAULTS
 
-    # ECL310 mixing valve + PID — present in both modes for parameter
-    # identifiability (Stage 2 estimates kp/Ti even in open-loop replay).
-    ecl310_valve = ValveTorchSystem(
-        id="ecl310_kr1_valve",
-        waterFlowRateMax=0.5,
-        valveAuthority=0.5,
-        
+    # ----- District-heating primary boundary (hot side of the shunt) ---------
+    primary_temp = tb.ScheduleSystem(
+        id="dh_primary_temp",
+        weekDayRulesetDict={
+            "ruleset_default_value": sd["T_primary_C"],
+            "ruleset_start_minute": [0], "ruleset_end_minute": [0],
+            "ruleset_start_hour": [0], "ruleset_end_hour": [24],
+            "ruleset_value": [sd["T_primary_C"]],
+        },
     )
-    ecl310_pid = tb.PIDControllerSystem(
-        id="ecl310_pid",
-        kp=0.5,
-        Ti=300.0,
-        Td=0.0,
-        isReverse=False,
-        
+    recirc_flow = tb.ScheduleSystem(
+        id="ecl310_recirc_flow",
+        weekDayRulesetDict={
+            "ruleset_default_value": sd["recirc_kgs"],
+            "ruleset_start_minute": [0], "ruleset_end_minute": [0],
+            "ruleset_start_hour": [0], "ruleset_end_hour": [24],
+            "ruleset_value": [sd["recirc_kgs"]],
+        },
     )
 
-    # PID setpoint: ECL310 outdoor-reset heating-curve trajectory.
-    # Calibration mode replays the precomputed curve CSV (from BMS T_oa/T_set);
-    # simulation mode uses a constant schedule the RL agent can override.
+    # ----- ECL310 supply-temperature setpoint (target tracked by the PID) ----
+    # Prefer the MEASURED BMS supply setpoint (Fremloebstemp.ref); the synthetic
+    # outdoor-reset curve over-predicts it (~64 vs ~51 degC) and would saturate
+    # the valve. Fall back to the synthetic curve only if the measured file is
+    # missing.
     if calibration_mode:
+        _measured_set = _csv("ecl310_TSupSet_measured.csv")
         ecl310_setpoint = tb.SensorSystem(
             id="ecl310_TSupSet_schedule",
-            filename=_csv("ecl310_TSupSet_curve.csv"),
+            filename=_measured_set if os.path.exists(_measured_set)
+            else _csv("ecl310_TSupSet_curve.csv"),
         )
         setpoint_port = "measuredValue"
     else:
@@ -264,80 +340,94 @@ def hydronic_fcn(self, *, calibration_mode: bool = True) -> None:
             id="ecl310_TSupSet_schedule",
             weekDayRulesetDict={
                 "ruleset_default_value": 50.0,
-                "ruleset_start_minute": [0],
-                "ruleset_end_minute": [0],
-                "ruleset_start_hour": [0],
-                "ruleset_end_hour": [24],
+                "ruleset_start_minute": [0], "ruleset_end_minute": [0],
+                "ruleset_start_hour": [0], "ruleset_end_hour": [24],
                 "ruleset_value": [50.0],
             },
         )
         setpoint_port = "scheduleValue"
-    self.add_connection(ecl310_setpoint, ecl310_pid, setpoint_port, "setpointValue")
-    self.add_connection(
-        supply_water_source, ecl310_pid, supply_port, "actualValue"
+
+    # ----- ECL310 PID + primary mixing valve ---------------------------------
+    # Reverse-acting: open the primary valve when the supply is BELOW the curve
+    # setpoint (too cold). Direct action would close the valve when cold.
+    ecl310_pid = tb.PIDControllerSystem(
+        id="ecl310_pid", kp=sd["pid_kp"], Ti=sd["pid_Ti"], Td=0.0, isReverse=True,
+    )
+    ecl310_valve = ValveTorchSystem(
+        id="ecl310_kr1_valve",
+        waterFlowRateMax=sd["primary_max_kgs"],
+        valveAuthority=1.0,
     )
     self.add_connection(ecl310_pid, ecl310_valve, "inputSignal", "valvePosition")
 
-    # ----- Fixed-opening radiator valves + radiators ------------------------
-    # Each of the 4 rooms has one radiator fed by a FIXED-opening valve. There is
-    # no per-room control: the valve position is constant and the design flow is
-    # captured by the estimable waterFlowRateMax. The single control lever is the
-    # building inlet temperature (mixing valve + ecl310_pid above). All radiators
-    # draw from the same supply line in parallel.
+    # ----- Supply mixing shunt (flow-weighted blend of primary + recirc) -----
+    # ReturnFlowJunctionSystem is reused as a generic flow-weighted temperature
+    # mixer: slot 0 = hot primary, slot 1 = recirculated return.
+    supply_mix = tb.ReturnFlowJunctionSystem(id="ecl310_supply_mix")
+    self.add_connection(primary_temp, supply_mix, "scheduleValue", "airTemperatureIn", input_port_index=0)
+    self.add_connection(ecl310_valve, supply_mix, "waterFlowRate", "airFlowRateIn", input_port_index=0)
+    # slot 1 (recirc temperature) is wired after the return junction exists below.
+    self.add_connection(recirc_flow, supply_mix, "scheduleValue", "airFlowRateIn", input_port_index=1)
+
+    # Produced secondary supply temperature: PID feedback + scored sensor.
+    self.add_connection(ecl310_setpoint, ecl310_pid, setpoint_port, "setpointValue")
+    self.add_connection(supply_mix, ecl310_pid, "airTemperatureOut", "actualValue")
+
+    ecl310_sup_sensor = tb.SensorSystem(
+        id="ecl310_TSupHea_y",
+        filename=_csv("ecl310_TSupHea_y_processed.csv") if calibration_mode else None,
+    )
+    self.add_connection(supply_mix, ecl310_sup_sensor, "airTemperatureOut", "measuredValue")
+
+    # ----- Fixed-opening radiator valves + radiators -------------------------
     radiator_fixed_position = tb.ScheduleSystem(
         id="radiator_fixed_position",
         weekDayRulesetDict={
             "ruleset_default_value": 1.0,
-            "ruleset_start_minute": [0],
-            "ruleset_end_minute": [0],
-            "ruleset_start_hour": [0],
-            "ruleset_end_hour": [24],
+            "ruleset_start_minute": [0], "ruleset_end_minute": [0],
+            "ruleset_start_hour": [0], "ruleset_end_hour": [24],
             "ruleset_value": [1.0],
         },
     )
-    for zone_id in ZONES:
+    return_junction = tb.ReturnFlowJunctionSystem(id="ecl310_return_junction")
+    for slot, zone_id in enumerate(ZONES):
         zone = self.components[zone_id]
+        # Construction max sets the (frozen) normalisation ceiling used by
+        # _set_radiator_flows(...).set(normalized=False); 0.1 kg/s gives headroom
+        # above the energy-balance-sized fixed flow (~0.005-0.02 kg/s).
         rad_valve = ValveTorchSystem(
-            id=f"{zone_id}_radiator_valve",
-            waterFlowRateMax=0.05,
-            valveAuthority=1.0,
+            id=f"{zone_id}_radiator_valve", waterFlowRateMax=0.1, valveAuthority=1.0,
         )
-        self.add_connection(
-            radiator_fixed_position, rad_valve, "scheduleValue", "valvePosition"
-        )
+        self.add_connection(radiator_fixed_position, rad_valve, "scheduleValue", "valvePosition")
 
-        radiator = SpaceHeaterTorchSystem(
-            id=f"{zone_id}_radiator",
-            **RADIATOR_DEFAULTS,
-        )
-        self.add_connection(
-            supply_water_source, radiator, supply_port, "supplyWaterTemperature"
-        )
+        radiator = SpaceHeaterTorchSystem(id=f"{zone_id}_radiator", **RADIATOR_DEFAULTS)
+        # Supply temperature now comes from the mixing shunt (the closed loop).
+        self.add_connection(supply_mix, radiator, "airTemperatureOut", "supplyWaterTemperature")
         self.add_connection(rad_valve, radiator, "waterFlowRate", "waterFlowRate")
         self.add_connection(zone, radiator, "indoorTemperature", "indoorTemperature")
         self.add_connection(radiator, zone, "Power", "heatGain")
 
-    # ----- Return-water sensor (virtual — for Stage 2 RMSE target) ----------
-    # NOTE: With no return-side mixing component, this sensor is connected to
-    # one representative radiator's outletWaterTemperature as a proxy. A proper
-    # mass-weighted mixing requires a custom WaterReturnJunctionSystem (TODO).
+        # Radiator returns feed the return manifold (flow-weighted mix).
+        self.add_connection(radiator, return_junction, "outletWaterTemperature",
+                            "airTemperatureIn", input_port_index=slot)
+        self.add_connection(rad_valve, return_junction, "waterFlowRate",
+                            "airFlowRateIn", input_port_index=slot)
+
+    # Close the loop: mixed return feeds the recirc branch of the supply shunt.
+    self.add_connection(return_junction, supply_mix, "airTemperatureOut",
+                        "airTemperatureIn", input_port_index=1)
+
+    # Return-water sensor (scored against measured BMS Retur).
     ecl310_ret_sensor = tb.SensorSystem(
         id="ecl310_TRetHea_y",
         filename=_csv("ecl310_TRetHea_y_processed.csv") if calibration_mode else None,
     )
-    representative_radiator = self.components[f"{next(iter(ZONES))}_radiator"]
-    self.add_connection(
-        representative_radiator, ecl310_ret_sensor, "outletWaterTemperature", "measuredValue"
-    )
+    self.add_connection(return_junction, ecl310_ret_sensor, "airTemperatureOut", "measuredValue")
 
-    # Varme heat-meter power sensor — leaf during calibration (target).
-    # In RL mode, total heat is computed in the gym layer by summing per-radiator
-    # Power outputs (no in-graph sum component exists).
     if calibration_mode:
         tb.SensorSystem(
             id="varme_meter_power_sensor",
             filename=_csv("varme_meter_power_kW.csv"),
-            
         )
 
 
@@ -381,21 +471,35 @@ def ahu_fcn(self, *, calibration_mode: bool = True) -> None:
         
     )
 
-    supply_air_setpoint = tb.ScheduleSystem(
-        id="supply_air_temp_setpoint_sensor",
-        weekDayRulesetDict={
-            "ruleset_default_value": 18.0,
-            "ruleset_start_minute": [0],
-            "ruleset_end_minute": [0],
-            "ruleset_start_hour": [0],
-            "ruleset_end_hour": [24],
-            "ruleset_value": [18.0],
-        },
-        
-    )
-    self.add_connection(
-        supply_air_setpoint, supply_heating_coil, "scheduleValue", "outletAirTemperatureSetpoint"
-    )
+    # Coil supply-air set-point.
+    #  - sim mode (RL): an RL-controllable schedule (the agent's AHU set-point lever).
+    #  - calibration mode: the set-point TRACKS the building mean room temperature
+    #    (the AHU return-air temperature, wired after the return junction is built
+    #    below), so ventilation is thermally ~neutral and the envelope+hydronic
+    #    calibration is preserved. At 3 ACH the ventilation conductance is large
+    #    (~250 W/°C per room), so a fixed set-point would be a big heating/cooling
+    #    source whenever a room deviates from it.
+    if not calibration_mode:
+        supply_air_setpoint = tb.ScheduleSystem(
+            id="supply_air_temp_setpoint_sensor",
+            weekDayRulesetDict={
+                "ruleset_default_value": AHU_DEFAULTS["supply_air_setpoint_C"],
+                "ruleset_start_minute": [0],
+                "ruleset_end_minute": [0],
+                "ruleset_start_hour": [0],
+                "ruleset_end_hour": [24],
+                "ruleset_value": [AHU_DEFAULTS["supply_air_setpoint_C"]],
+            },
+        )
+        self.add_connection(
+            supply_air_setpoint, supply_heating_coil, "scheduleValue", "outletAirTemperatureSetpoint"
+        )
+        # The heat recovery must share the supply-air target, otherwise its
+        # primaryTemperatureOutSetpoint defaults to 0 °C and it clamps its
+        # recovered-air output to 0 °C (no recovery → the coil over-heats).
+        self.add_connection(
+            supply_air_setpoint, heat_recovery, "scheduleValue", "primaryTemperatureOutSetpoint"
+        )
 
     supply_air_temp_sensor = tb.SensorSystem(
         id="vent_supply_air_temp_sensor"
@@ -420,13 +524,38 @@ def ahu_fcn(self, *, calibration_mode: bool = True) -> None:
         supply_fan, supply_heating_coil, "outletAirTemperature", "inletAirTemperature"
     )
 
+    # Baseline VAV position: fully open at the design (3-ACH) flow. In calibration
+    # mode this fixed schedule drives every damper (so the air loop is ACTIVE — the
+    # dampers were previously inert because the position input was unconnected →
+    # default 0 → zero flow). In sim mode the per-room damper position is an RL
+    # action (left unconnected here so the gym can write it).
+    if calibration_mode:
+        vav_fixed_position = tb.ScheduleSystem(
+            id="vav_fixed_position",
+            weekDayRulesetDict={
+                "ruleset_default_value": 1.0,
+                "ruleset_start_minute": [0],
+                "ruleset_end_minute": [0],
+                "ruleset_start_hour": [0],
+                "ruleset_end_hour": [24],
+                "ruleset_value": [1.0],
+            },
+        )
+
+    ach = AHU_DEFAULTS["ventilation_ach"]
     for slot, (zone_id, cfg) in enumerate(ZONES.items()):
+        # Size the damper so fully open delivers the room's 3-ACH design flow.
         zone_damper = DamperTorchSystem(
             id=f"{zone_id}_supply_damper",
-            nominalAirFlowRate=cfg["nominal_flow_kgs"],
+            nominalAirFlowRate=zone_ventilation_flow(zone_id, ach),
             a=AHU_DEFAULTS["damper_a"],
         )
         zone = self.components[zone_id]
+
+        if calibration_mode:
+            self.add_connection(
+                vav_fixed_position, zone_damper, "scheduleValue", "damperPosition"
+            )
 
         # Damper aggregates total fan flow demand (Vector input)
         self.add_connection(
@@ -463,6 +592,20 @@ def ahu_fcn(self, *, calibration_mode: bool = True) -> None:
     self.add_connection(
         return_junction, ahu_return_air_temp_sensor, "airTemperatureOut", "measuredValue"
     )
+    # Calibration mode: coil set-point tracks the building mean room temperature
+    # (the return-air temperature) so the supply air ≈ room temp → ventilation is
+    # thermally neutral and the envelope+hydronic calibration is preserved.
+    if calibration_mode:
+        self.add_connection(
+            ahu_return_air_temp_sensor, supply_heating_coil,
+            "measuredValue", "outletAirTemperatureSetpoint",
+        )
+        # Heat recovery shares the same supply-air target (else it clamps its
+        # recovered-air output to its default 0 °C set-point → no recovery).
+        self.add_connection(
+            ahu_return_air_temp_sensor, heat_recovery,
+            "measuredValue", "primaryTemperatureOutSetpoint",
+        )
     self.add_connection(
         return_junction, heat_recovery, "airTemperatureOut", "secondaryTemperatureIn"
     )
@@ -475,6 +618,14 @@ def ahu_fcn(self, *, calibration_mode: bool = True) -> None:
 # Master fcn / model factories
 # ---------------------------------------------------------------------------
 def make_fcn(calibration_mode: bool = True) -> Callable:
+    """Master fcn factory.
+
+    The hydronic system is the closed-loop mixing-shunt substation: the secondary
+    supply temperature is produced by the ECL310 PID + mixing valve and the
+    recirculation feedback, so supply and return co-vary with the radiator load
+    instead of the supply being pinned to a replayed boundary. This is the single
+    hydronic model (the open-loop replay path was removed).
+    """
     def _fcn(self) -> None:
         # inject_heat_boundary=False: radiator Power drives heatGain in the full model.
         envelope_fcn(self, calibration_mode=calibration_mode, inject_heat_boundary=False)
@@ -490,6 +641,178 @@ def make_envelope_fcn(calibration_mode: bool = True) -> Callable:
     return _fcn
 
 
+def _set_radiator_flows(model, rad_flow: float) -> None:
+    """Set the four fixed radiator-valve design flows [kg/s] post-build.
+
+    tps.Parameter stores its data NORMALISED to [0, 1] against the min/max frozen
+    at construction, so the physical value must be written through .set(...,
+    normalized=False) (writing .data directly sets the normalised slot — e.g.
+    .data.fill_(0.02) yields get()==0.02*0.02==0.0004 kg/s, which silently starves
+    the radiators). The ECL310 primary mixing valve is deliberately LEFT at its
+    high default max so the PID keeps fine authority over the supply blend.
+    """
+    for zone_id in ZONES:
+        model.components[f"{zone_id}_radiator_valve"].waterFlowRateMax.set(
+            float(rad_flow), normalized=False
+        )
+
+
+def _read_window_mean(csv_name: str, start, end) -> float:
+    """Mean of a generated data CSV's 'value' column over the [start, end] window.
+
+    CSVs are written in UTC; start/end are converted to UTC for filtering.
+    """
+    import pandas as pd
+
+    s = pd.read_csv(os.path.join(DATA_DIR, csv_name), index_col=0)["value"]
+    s.index = pd.to_datetime(s.index, utc=True)
+    lo = pd.Timestamp(start).tz_convert("UTC")
+    hi = pd.Timestamp(end).tz_convert("UTC")
+    return float(s[(s.index >= lo) & (s.index <= hi)].mean())
+
+
+def _apply_sizing(model, *, Q_per_rad, T_sup, T_ret, T_air, m_per_rad) -> None:
+    """Pin each radiator's nominal rating to the operating point and set the fixed
+    radiator-loop flow. Must run BEFORE first initialize() (SpaceHeaterTorchSystem
+    solves and freezes UA from the nominal rating on first init)."""
+    for zone_id in ZONES:
+        rad = model.components[f"{zone_id}_radiator"]
+        rad.Q_flow_nominal_sh = float(Q_per_rad)
+        rad.T_a_nominal_sh = float(T_sup)
+        rad.T_b_nominal_sh = float(T_ret)
+        rad.TAir_nominal_sh = float(T_air)
+    _set_radiator_flows(model, float(m_per_rad))
+
+
+def _sim_mean_zone_and_power(Q_nominal_total, m_per_rad, *, start, end, step,
+                             warmup_steps, T_sup, T_ret, T_air, envelope_pickle):
+    """Build + size + simulate the closed loop for a candidate nominal rating and
+    fixed flow; return (mean zone temperature across rooms, mean total radiator
+    Power). If m_per_rad is None the flow is derived from the energy balance
+    m = (Q_nominal/4) / (cp * dT_measured).
+
+    A fresh model is built each call because UA is frozen on first initialize(),
+    so the nominal rating cannot be changed in place.
+    """
+    cp = float(t4b_constants.CP_WATER)
+    n = len(ZONES)
+    Q_per_rad = Q_nominal_total / n
+    if m_per_rad is None:
+        m_per_rad = Q_per_rad / (cp * max(T_sup - T_ret, 1e-3))
+
+    model = get_model(id="skoven_sizing_probe",
+                      fcn_=make_fcn(calibration_mode=True), calibration_mode=True)
+    if os.path.exists(envelope_pickle):
+        model.load_estimation_result(envelope_pickle)
+    _apply_sizing(model, Q_per_rad=Q_per_rad, T_sup=T_sup, T_ret=T_ret,
+                  T_air=T_air, m_per_rad=m_per_rad)
+    tb.Simulator(model).simulate(start_time=start, end_time=end, step_size=step)
+
+    zone_sum = 0.0
+    power_sum = None
+    for z in ZONES:
+        zt = model.components[f"{z}_indoor_temp_sensor"].output["measuredValue"]
+        zt = zt.history(i_s=0, i_c=0).detach().cpu().numpy().reshape(-1)[warmup_steps:]
+        zone_sum += float(zt.mean())
+        p = model.components[f"{z}_radiator"].output["Power"]
+        p = p.history(i_s=0, i_c=0).detach().cpu().numpy().reshape(-1)[warmup_steps:]
+        power_sum = p if power_sum is None else power_sum + p
+    return zone_sum / n, float(power_sum.mean()), m_per_rad
+
+
+def _bisect_rating_for_zones(m_per_rad, *, target, n_iter, Q_bracket, label, **kw):
+    """Bisection on the total nominal rating to drive the simulated mean zone temp
+    to `target`. Simulated zone temp increases monotonically with delivered heat."""
+    lo, hi = Q_bracket
+    Q = 0.5 * (lo + hi)
+    zmean = power = float("nan")
+    used_flow = m_per_rad
+    for i in range(n_iter):
+        Q = 0.5 * (lo + hi)
+        zmean, power, used_flow = _sim_mean_zone_and_power(Q, m_per_rad, **kw)
+        print(f"  [{label}] iter {i+1}/{n_iter}: Q_nom={Q:7.1f} W, flow/rad="
+              f"{used_flow:.4f} kg/s -> zoneT={zmean:5.2f} C (target {target:5.2f}) "
+              f" Sigma Power={power:7.1f} W")
+        if zmean > target:   # over-heating -> reduce rating
+            hi = Q
+        else:
+            lo = Q
+    return Q, power, used_flow
+
+
+def compute_winter_sizing(
+    start,
+    end,
+    *,
+    envelope_pickle: Optional[str] = None,
+    step: int = 600,
+    warmup_steps: int = 24,
+    n_iter: int = 9,
+    Q_bracket=(400.0, 9000.0),
+) -> dict:
+    """Energy-balance sizing for the closed-loop radiators + fixed flow.
+
+    The radiator steady-state heat output (UA) is NOT AD-calibratable in Twin4Build
+    (SpaceHeaterTorchSystem re-solves UA from the float nominal rating inside
+    initialize() and freezes it). To keep the hydronic stage consistent with the
+    Stage-1 envelope — calibrated with per-room heat input = district-heat power / 4
+    — we SIZE the radiators from the envelope's own heat demand:
+
+      - Pin each radiator's nominal temps to the measured OPERATING point
+        (T_a=supply, T_b=return, TAir=indoor); the fixed flow is the design flow of
+        the rating, m = (Q/4) / (cp * (T_sup - T_ret)).
+      - Bisect the nominal rating until the SIMULATED mean zone temperature equals
+        the measured mean — i.e. the radiators hold the building exactly. This is
+        the control-relevant target and the physically meaningful heat demand (a
+        free-running radiator at an arbitrary rating would over/under-heat).
+
+    Note on the supply/return ↔ zone tension: with the envelope fixed and the
+    radiator UA/flow non-AD, the zone-temperature and return-water targets cannot
+    both be matched exactly (matching zones leaves a return offset and vice versa).
+    We size for the zones (the RL-relevant signal) and report the realized Σ Power
+    vs the metered energy as the consistency diagnostic (validation_plots spring
+    check). `Q_realized_total` is that realized heat output at the zone match.
+
+    Returns a sizing dict consumed by apply_energy_balance_sizing().
+    """
+    n = len(ZONES)
+    if envelope_pickle is None:
+        envelope_pickle = ENVELOPE_RESULT_PICKLE
+
+    T_sup = _read_window_mean("ecl310_TSupHea_y_processed.csv", start, end)
+    T_ret = _read_window_mean("ecl310_TRetHea_y_processed.csv", start, end)
+    T_air = sum(_read_window_mean(f"{z}_indoor_temperature.csv", start, end)
+                for z in ZONES) / n
+
+    kw = dict(start=start, end=end, step=step, warmup_steps=warmup_steps,
+              target=T_air, n_iter=n_iter, Q_bracket=Q_bracket,
+              T_sup=T_sup, T_ret=T_ret, T_air=T_air, envelope_pickle=envelope_pickle)
+
+    # Bisection on the nominal rating (flow coupled via the energy balance) to hold
+    # the measured mean zone temperature.
+    Q_final, P_final, m_per_rad = _bisect_rating_for_zones(None, label="zone-match", **kw)
+
+    return {
+        "Q_demand_total": Q_final,
+        "Q_realized_total": P_final,
+        "T_sup": T_sup,
+        "T_ret": T_ret,
+        "T_air": T_air,
+        "Q_per_rad": Q_final / n,
+        "m_per_rad": m_per_rad,
+    }
+
+
+def apply_energy_balance_sizing(model, sizing: dict) -> None:
+    """Apply an energy-balance sizing dict (from compute_winter_sizing) to a built
+    model: pin each radiator's nominal rating to the operating point and set the
+    fixed radiator-loop flow. Must be called BEFORE the model is initialized.
+    """
+    _apply_sizing(model, Q_per_rad=sizing["Q_per_rad"], T_sup=sizing["T_sup"],
+                  T_ret=sizing["T_ret"], T_air=sizing["T_air"],
+                  m_per_rad=sizing["m_per_rad"])
+
+
 def fcn(self) -> None:
     """Default master fcn — calibration mode."""
     make_fcn(calibration_mode=True)(self)
@@ -503,12 +826,17 @@ def get_model(
     if fcn_ is None:
         fcn_ = make_fcn(calibration_mode=calibration_mode)
     model = tb.Model(id=id)
+    # force_config_overwrite=False: the parameters defined IN the fcn (constructors,
+    # e.g. the 3-ACH damper sizing, RADIATOR_DEFAULTS, AHU_DEFAULTS) take priority;
+    # the per-component cached JSONs only fill params left None. With True the STALE
+    # cached files would override the fcn values (it silently reset the new 3-ACH
+    # damper sizing back to a stale 0.05 kg/s). See SimulationModel._load_parameters.
     model.load(
         fcn=fcn_,
         draw_semantic_model=False,
         draw_simulation_model=False,
         validate_model=True,
-        force_config_overwrite=True,
+        force_config_overwrite=False,
     )
     return model
 

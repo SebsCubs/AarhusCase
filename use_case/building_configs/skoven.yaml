@@ -45,15 +45,18 @@ el_meter_id: "19591181"     # provisional (most active EL meter)
 # 2025-03-30) so it uses the BMS-meter overlap. Meters end 2025-05-31.
 envelope_start: "2025-01-15"
 envelope_end: "2025-01-22"
-# NOTE: space heating is a winter phenomenon but BMS water signals only begin
-# 2025-03-30, so the hydronic stage runs on the earliest BMS+meter overlap,
-# where heating is already low. Calibration strength is therefore limited.
-# Windows kept to ~1 week so AD-SLSQP estimation is tractable; widen later.
-hydronic_start: "2025-03-31"  # BMS water data begins 2025-03-30 07:00; start a
-hydronic_end: "2025-04-07"    # day later so boundary CSVs have no leading NaN
-# Data export window spanning both stages
+# Hydronic stage now uses a real WINTER window: BMS water signals run to
+# 2026-03-30, and Jan-2026 shows a proper heating regime (T_sup ~50 °C,
+# T_ret ~36 °C, dT ~14 °C) that makes the radiator UA/flow genuinely
+# identifiable — unlike the earlier low-heat spring overlap (dT ~1 °C). The
+# heat meter ends 2025-05-31, so this window targets return-water + zone temps
+# (ReMoni runs to 2026-04), not the varme power.
+hydronic_start: "2026-01-08"
+hydronic_end: "2026-01-15"
+# Data export window spans the Stage-1 envelope (Jan 2025) and the Stage-2
+# winter hydronic (Jan 2026) windows.
 export_start: "2025-01-01"
-export_end: "2025-05-31"
+export_end: "2026-02-28"
 # RL windows (calibrated-model simulation; not bounded by meter data)
 train_start: "2024-12-01"
 train_end: "2025-12-01"

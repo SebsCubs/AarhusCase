@@ -24,10 +24,13 @@ sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 import twin4build as tb
 from aarhus_model.skoven_model import (
     get_model, make_fcn, make_envelope_fcn, ZONES, DATA_DIR,
+    compute_winter_sizing, apply_energy_balance_sizing,
     ENVELOPE_RESULT_PICKLE, HYDRONIC_RESULT_PICKLE, AHU_RESULT_PICKLE,
 )
 
 TZ = "Europe/Copenhagen"
+# Winter window used to derive the energy-balance radiator sizing (matches Stage 2).
+HYDRONIC_WINDOW = ("2026-01-08", "2026-01-15")
 
 # The hydronic loop is driven by BMS water signals (supply/return temperature,
 # setpoint curve) that only exist in the spring overlap window. Outside that
@@ -121,6 +124,14 @@ def main():
                    ("ahu", AHU_RESULT_PICKLE)]
 
     model = get_model(id="skoven_calib_eval", fcn_=fcn_, calibration_mode=True)
+    # The closed-loop hydronic radiators are SIZED from the envelope energy balance
+    # (Stage 2); apply the same sizing before loading the estimated pickle so the
+    # evaluated model matches calibration. (Envelope-only stage has no radiators.)
+    if stage != "envelope":
+        wtz = gettz(TZ)
+        wstart = datetime.datetime.fromisoformat(HYDRONIC_WINDOW[0]).replace(tzinfo=wtz)
+        wend = datetime.datetime.fromisoformat(HYDRONIC_WINDOW[1]).replace(tzinfo=wtz)
+        apply_energy_balance_sizing(model, compute_winter_sizing(wstart, wend, step=args.step))
     for label, p in pickles:
         if os.path.exists(p):
             model.load_estimation_result(p)

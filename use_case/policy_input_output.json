@@ -1,11 +1,11 @@
 {
     "actions": {
-        "ecl310_TSupHea_y": {
+        "ecl310_TSupSet_schedule": {
             "scheduleValue": {
                 "signal_key": "scheduleValue",
                 "min": 20,
                 "max": 70,
-                "description": "Building inlet (supply) water temperature setpoint [°C] — the single hydronic control lever (mixing valve target)"
+                "description": "Supply water temperature SETPOINT [°C] tracked by the ECL310 PID (the single hydronic control lever; the PID modulates the mixing valve to hit it)"
             }
         },
         "room_a_supply_damper": {
@@ -34,11 +34,11 @@
             }
         },
         "ecl310_TSupHea_y": {
-            "scheduleValue": {
-                "signal_key": "scheduleValue",
+            "measuredValue": {
+                "signal_key": "measuredValue",
                 "min": 20,
                 "max": 80,
-                "description": "Building inlet water temperature [°C] (schedule in sim mode)"
+                "description": "Building supply (inlet) water temperature [°C] — produced output of the mixing shunt (PID-controlled)"
             }
         },
         "ecl310_TRetHea_y": {

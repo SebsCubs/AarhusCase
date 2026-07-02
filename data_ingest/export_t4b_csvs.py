@@ -106,6 +106,12 @@ def export(building: str = "skoven", start: str = None, end: str = None,
         written.append("ecl310_TRetHea_y_processed")
     if "T_zone_set" in df and _write(out_dir, "zone_TZonSet_u_processed", df["T_zone_set"]):
         written.append("zone_TZonSet_u_processed")
+    # Measured ECL310 supply-temperature setpoint (BMS Fremloebstemp.ref) — the
+    # real outdoor-reset target the controller tracked. Used as the setpoint for
+    # the CLOSED-LOOP hydronic model (the synthetic heating curve below over-
+    # predicts it). Falls back to the synthetic curve when this signal is absent.
+    if "T_sup_w_set" in df and _write(out_dir, "ecl310_TSupSet_measured", df["T_sup_w_set"]):
+        written.append("ecl310_TSupSet_measured")
 
     # --- Heating-curve supply setpoint (Phase D: drives ecl310 setpoint schedule) ---
     if {"T_oa", "T_zone_set"}.issubset(df.columns):

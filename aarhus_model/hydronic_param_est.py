@@ -1,15 +1,28 @@
-"""Stage 2: Hydronic system parameter estimation for Skoven.
+"""Stage 2: Closed-loop hydronic parameter estimation for Skoven.
 
-The building has one control lever (inlet water temperature via a mixing valve +
-PID) and 4 fixed-flow radiators. With the inlet temperature replayed as a
-measured boundary, only the per-room radiator parameters are identifiable:
-  - Per-room radiator: thermalMassHeatCapacity
-  - Per-room fixed-opening valve: waterFlowRateMax (the design flow)
+The hydronic system is the closed-loop ECL310 mixing-shunt substation (the only
+hydronic model). A PID modulates the primary mixing valve to track the measured
+supply-temperature setpoint; the secondary supply temperature is a PRODUCED output
+and the return co-varies with the radiator heat extraction via the recirculation
+feedback. The 4 radiators sit on fixed-opening valves (constant flow).
 
-Radiator nominal ratings (Q_flow_nominal_sh, T_a/T_b/TAir_nominal_sh) are plain
-floats in SpaceHeaterTorchSystem (no autograd gradient) and the mixing-valve /
-ecl310_pid parameters are not identifiable from boundary-replayed supply temp, so
-all are held at their priors. Estimation targets zone temps + return-water temp.
+What is estimated vs. sized
+---------------------------
+- **Sized from the energy balance** (NOT estimated): each radiator's nominal
+  rating (-> UA -> steady-state heat output / supply-return dT) and the fixed
+  radiator-loop flow. The radiator UA is non-AD-calibratable in Twin4Build
+  (SpaceHeaterTorchSystem re-solves UA from the float nominal rating inside
+  initialize() and freezes it), and free-fitting it would break consistency with
+  the Stage-1 envelope (calibrated with per-room heat input = district-heat
+  power / 4). compute_winter_sizing() pins the rating to the measured operating
+  point so total radiator output matches the envelope's heat demand and each
+  radiator delivers ~Q_meter/4 by construction. See skoven_model.py.
+- **Estimated by AD** (the genuinely identifiable, in-path levers):
+    * ecl310_pid: kp, Ti        — controller (supply tracking)
+    * per-radiator thermalMassHeatCapacity — radiator thermal inertia (dynamics)
+
+Targets (all are PRODUCED outputs in the closed loop, so all are valid AD targets):
+  4 zone temperatures + supply-water temperature + return-water temperature.
 
 Loads the Stage 1 envelope pickle first.
 
@@ -30,12 +43,18 @@ sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 
 import twin4build as tb
 from aarhus_model.skoven_model import (
-    get_model, ZONES, ENVELOPE_RESULT_PICKLE, HYDRONIC_RESULT_PICKLE,
+    get_model, make_fcn, ZONES, ENVELOPE_RESULT_PICKLE, HYDRONIC_RESULT_PICKLE,
+    compute_winter_sizing, apply_energy_balance_sizing,
 )
 
 TZ = "Europe/Copenhagen"
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "..", "use_case", "building_configs")
 STEP_SIZE = 600
+
+# Measurement standard deviations [°C] used to weight the objective. Water
+# signals get a slightly looser std than the ReMoni zone temps.
+ZONE_STD = 0.5
+WATER_STD = 1.0
 
 
 def _window(building: str):
@@ -50,39 +69,54 @@ def _window(building: str):
 def run_estimation(building: str = "skoven", step: int = STEP_SIZE):
     start, end = _window(building)
     maxiter = int(os.environ.get("AARHUS_MAXITER", 60))
-    print(f"Stage 2 — Hydronic estimation: {start} -> {end} (maxiter={maxiter})")
+    print(f"Stage 2 — Closed-loop hydronic estimation: {start} -> {end} (maxiter={maxiter})")
 
-    model = get_model(id="skoven_hydronic_est", calibration_mode=True)
+    if not os.path.exists(ENVELOPE_RESULT_PICKLE):
+        print(f"Warning: Stage 1 pickle not found ({ENVELOPE_RESULT_PICKLE}); "
+              f"sizing/estimation will use envelope defaults.")
+
+    # Energy-balance sizing: derive the radiator rating + fixed flow from the
+    # envelope's heat demand and the measured operating point (consistent with the
+    # Stage-1 per-room heat split). Done up front so the figures are reproducible.
+    sizing = compute_winter_sizing(start, end, step=step)
+    print("Energy-balance sizing (from envelope demand + measured operating point):")
+    print(f"  Q_demand_total = {sizing['Q_demand_total']:.1f} W "
+          f"(~{sizing['Q_demand_total']/1000:.2f} kW)  ->  Q_per_rad = {sizing['Q_per_rad']:.1f} W")
+    print(f"  operating point: T_sup={sizing['T_sup']:.1f} C  T_ret={sizing['T_ret']:.1f} C  "
+          f"T_air={sizing['T_air']:.1f} C  (dT={sizing['T_sup']-sizing['T_ret']:.1f} C)")
+    print(f"  fixed flow per radiator = {sizing['m_per_rad']:.4f} kg/s "
+          f"(total {4*sizing['m_per_rad']:.4f} kg/s)")
+
+    model = get_model(id="skoven_hydronic_est",
+                      fcn_=make_fcn(calibration_mode=True),
+                      calibration_mode=True)
     if os.path.exists(ENVELOPE_RESULT_PICKLE):
         model.load_estimation_result(ENVELOPE_RESULT_PICKLE)
         print("Loaded Stage 1 envelope parameters.")
-    else:
-        print(f"Warning: Stage 1 pickle not found ({ENVELOPE_RESULT_PICKLE}); using defaults.")
+    apply_energy_balance_sizing(model, sizing)
 
-    # Only the radiator thermal mass and the fixed design flow per room are
-    # identifiable here: the supply (inlet) water temperature is a measured
-    # boundary, so the mixing-valve / ecl310_pid parameters cannot be identified
-    # from this data and are left at their defaults.
-    parameters = []
+    # AD parameters: PID gains (controller) + per-radiator thermal mass (dynamics).
+    # (component, attr, x0, lb, ub). Q_flow_nominal_sh / UA are SIZED above, not
+    # estimated (non-AD), and the radiator flow is fixed by the sizing.
+    pid = model.components["ecl310_pid"]
+    parameters = [
+        (pid, "kp", 0.05, 1e-3, 5.0),
+        (pid, "Ti", 1800.0, 60.0, 7200.0),
+    ]
     for zone_id in ZONES:
         radiator = model.components[f"{zone_id}_radiator"]
-        rad_valve = model.components[f"{zone_id}_radiator_valve"]
-        parameters += [
-            (radiator, "thermalMassHeatCapacity", 5000.0, 100.0, 50000.0),
-            (rad_valve, "waterFlowRateMax", 0.05, 0.001, 1.0),
-        ]
+        parameters.append((radiator, "thermalMassHeatCapacity", 5000.0, 100.0, 50000.0))
 
-    # Measurements: zone temps + return-water temp. Supply-water is a boundary
-    # input (not predicted) and the varme power sensor is a leaf (no simulated
-    # connection), so neither is a valid AD target here.
+    # Measurements: 4 zone temps + supply + return water (all produced outputs).
     measurements = []
     for zone_id in ZONES:
         sensor = model.components.get(f"{zone_id}_indoor_temp_sensor")
         if sensor is not None:
-            measurements.append((sensor, 0.5))
-    ret = model.components.get("ecl310_TRetHea_y")
-    if ret is not None and ret.filename is not None:
-        measurements.append((ret, 1.0))
+            measurements.append((sensor, ZONE_STD))
+    for water_id in ("ecl310_TSupHea_y", "ecl310_TRetHea_y"):
+        sensor = model.components.get(water_id)
+        if sensor is not None:
+            measurements.append((sensor, WATER_STD))
 
     simulator = tb.Simulator(model)
     estimator = tb.Estimator(simulator)
@@ -100,6 +134,10 @@ def run_estimation(building: str = "skoven", step: int = STEP_SIZE):
     shutil.copy(estimator.result_savedir_pickle, HYDRONIC_RESULT_PICKLE)
     model.load_estimation_result(HYDRONIC_RESULT_PICKLE)
     print(f"Stage 2 complete. Result: {HYDRONIC_RESULT_PICKLE}")
+    print(f"  estimated kp={float(pid.kp.get()):.4f}  Ti={float(pid.Ti.get()):.1f} s")
+    for zone_id in ZONES:
+        rad = model.components[f"{zone_id}_radiator"]
+        print(f"  {zone_id}: thermalMassHeatCapacity={float(rad.thermalMassHeatCapacity.get()):.0f} J/K")
     return model
 
 
