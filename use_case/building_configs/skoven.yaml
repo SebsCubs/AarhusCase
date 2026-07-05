@@ -54,14 +54,22 @@ envelope_end: "2025-01-22"
 hydronic_start: "2026-01-08"
 hydronic_end: "2026-01-15"
 # Data export window spans the Stage-1 envelope (Jan 2025) and the Stage-2
-# winter hydronic (Jan 2026) windows.
-export_start: "2025-01-01"
-export_end: "2026-02-28"
-# RL windows (calibrated-model simulation; not bounded by meter data)
+# winter hydronic (Jan 2026) windows, widened to cover the RL train+eval
+# windows below (sim mode only reads outdoor_temperature/global_irradiation,
+# both independent of the BMS/ReMoni/meter coverage limits — see
+# data_ingest/unify.py — so this range is set by the RL windows, not by
+# instrumentation availability).
+export_start: "2024-06-01"
+export_end: "2026-06-01"
+# RL windows (calibrated-model simulation; sim mode only needs the weather
+# boundary CSVs, so these just need to sit inside export_start/export_end).
+# Disjoint train/eval split: eval covers the real Jan-2026 winter used for
+# Stage-2 hydronic calibration, so RL-vs-baseline results are directly
+# comparable to the calibrated operating point.
 train_start: "2024-12-01"
-train_end: "2025-12-01"
-eval_start: "2026-01-01"
-eval_end: "2026-04-15"
+train_end: "2025-11-01"
+eval_start: "2025-12-01"
+eval_end: "2026-05-15"
 
 # Radiator nominal parameters (initial guess; refined by Stage 2)
 radiator:

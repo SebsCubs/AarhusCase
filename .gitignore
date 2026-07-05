@@ -51,4 +51,5 @@ Thumbs.db
 # Project-specific generated output
 generated_files/
 plots/
+plots_*/
 logs/

@@ -29,7 +29,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 
 from data_ingest.unify import build_skoven_frame
+from data_ingest import weather_openmeteo, outdoor_synth
 from aarhus_model.heating_curve import precompute_schedule
+
+TZ = "Europe/Copenhagen"
 
 OUT_DIR = os.path.join(
     SCRIPT_DIR, "..", "aarhus_model", "generated_files", "data", "skoven"
@@ -90,11 +93,27 @@ def export(building: str = "skoven", start: str = None, end: str = None,
 
     written = []
 
-    # --- Boundary signals ---
-    if _write(out_dir, "outdoor_temperature", df["T_oa"]):
+    # --- Boundary weather signals: written over the FULL [start, end] range,
+    # independent of `df`'s index. `build_skoven_frame`'s `combined` frame is
+    # bounded by the union of BMS/ReMoni/meter coverage (whichever source ends
+    # soonest — e.g. ReMoni ~2026-04), so reading weather off `df` silently
+    # truncates it even though open-meteo/pvlib cover the full requested range.
+    # Sim-mode RL only needs these two boundary signals (all other sim-mode
+    # sensor filenames are None), so their range should track export_start/end,
+    # not instrumentation availability.
+    weather_idx = pd.date_range(
+        start=pd.Timestamp(start, tz=TZ), end=pd.Timestamp(end, tz=TZ), freq="15min"
+    )
+    t_oa = weather_openmeteo.fetch_outdoor_temperature(start, end)
+    t_oa = t_oa[~t_oa.index.duplicated(keep="first")].sort_index()
+    t_oa = t_oa.reindex(t_oa.index.union(weather_idx)).interpolate(method="time").reindex(weather_idx)
+    if _write(out_dir, "outdoor_temperature", t_oa):
         written.append("outdoor_temperature")
-    if "ghi_clearsky_Wm2" in df and _write(out_dir, "global_irradiation", df["ghi_clearsky_Wm2"]):
+
+    ghi = outdoor_synth.synthesize_ghi(weather_idx)
+    if _write(out_dir, "global_irradiation", ghi):
         written.append("global_irradiation")
+
     co2 = pd.Series(400.0, index=df.index)
     if _write(out_dir, "outdoor_co2", co2):
         written.append("outdoor_co2")

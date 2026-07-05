@@ -524,23 +524,26 @@ def ahu_fcn(self, *, calibration_mode: bool = True) -> None:
         supply_fan, supply_heating_coil, "outletAirTemperature", "inletAirTemperature"
     )
 
-    # Baseline VAV position: fully open at the design (3-ACH) flow. In calibration
-    # mode this fixed schedule drives every damper (so the air loop is ACTIVE — the
-    # dampers were previously inert because the position input was unconnected →
-    # default 0 → zero flow). In sim mode the per-room damper position is an RL
-    # action (left unconnected here so the gym can write it).
-    if calibration_mode:
-        vav_fixed_position = tb.ScheduleSystem(
-            id="vav_fixed_position",
-            weekDayRulesetDict={
-                "ruleset_default_value": 1.0,
-                "ruleset_start_minute": [0],
-                "ruleset_end_minute": [0],
-                "ruleset_start_hour": [0],
-                "ruleset_end_hour": [24],
-                "ruleset_value": [1.0],
-            },
-        )
+    # Baseline VAV position: fully open at the design (3-ACH) flow. Wired
+    # UNCONDITIONALLY (both modes) so the air loop always has a sane default —
+    # dampers were previously inert in sim mode whenever a component wasn't also
+    # listed as an RL action (unconnected input defaults to 0 flow, silently
+    # starving ventilation). The gym's per-step input override
+    # (`_do_component_timestep` step 2 in t4b_gym_env.py) runs AFTER this
+    # connection is assigned, so an RL action on `damperPosition` still wins
+    # whenever the policy config includes it; this schedule is only the fallback
+    # for dampers the RL agent doesn't control.
+    vav_fixed_position = tb.ScheduleSystem(
+        id="vav_fixed_position",
+        weekDayRulesetDict={
+            "ruleset_default_value": 1.0,
+            "ruleset_start_minute": [0],
+            "ruleset_end_minute": [0],
+            "ruleset_start_hour": [0],
+            "ruleset_end_hour": [24],
+            "ruleset_value": [1.0],
+        },
+    )
 
     ach = AHU_DEFAULTS["ventilation_ach"]
     for slot, (zone_id, cfg) in enumerate(ZONES.items()):
@@ -552,10 +555,9 @@ def ahu_fcn(self, *, calibration_mode: bool = True) -> None:
         )
         zone = self.components[zone_id]
 
-        if calibration_mode:
-            self.add_connection(
-                vav_fixed_position, zone_damper, "scheduleValue", "damperPosition"
-            )
+        self.add_connection(
+            vav_fixed_position, zone_damper, "scheduleValue", "damperPosition"
+        )
 
         # Damper aggregates total fan flow demand (Vector input)
         self.add_connection(

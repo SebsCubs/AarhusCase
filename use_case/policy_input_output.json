@@ -1,4 +1,5 @@
 {
+    "_disabled_actions_note": "The full action space (per-room VAV dampers + AHU supply-air setpoint) is documented in docs/RL_CONTROL_PLAN.md and kept out of `actions` for the first trained policy: the calibration runbook found the dampers/AHU are activated-by-construction, not identifiable from zone temps, so RL savings can't be cleanly attributed to them yet. They stay at their calibrated baseline (fixed 3-ACH open dampers, neutral-tracking AHU setpoint schedule — see ahu_fcn's unconditional `vav_fixed_position` wiring in aarhus_model/skoven_model.py) unless re-added here. Re-adding an entry moves that lever under RL control; no other code changes needed (the gym's per-step input override always wins over the baseline connection once a signal is listed as an action).",
     "actions": {
         "ecl310_TSupSet_schedule": {
             "scheduleValue": {
@@ -7,21 +8,6 @@
                 "max": 70,
                 "description": "Supply water temperature SETPOINT [°C] tracked by the ECL310 PID (the single hydronic control lever; the PID modulates the mixing valve to hit it)"
             }
-        },
-        "room_a_supply_damper": {
-            "damperPosition": {"signal_key": "damperPosition", "min": 0, "max": 1, "description": "Room A AHU supply damper position"}
-        },
-        "room_b_supply_damper": {
-            "damperPosition": {"signal_key": "damperPosition", "min": 0, "max": 1, "description": "Room B AHU supply damper position"}
-        },
-        "room_c_supply_damper": {
-            "damperPosition": {"signal_key": "damperPosition", "min": 0, "max": 1, "description": "Room C AHU supply damper position"}
-        },
-        "room_d_supply_damper": {
-            "damperPosition": {"signal_key": "damperPosition", "min": 0, "max": 1, "description": "Room D AHU supply damper position"}
-        },
-        "supply_air_temp_setpoint_sensor": {
-            "scheduleValue": {"signal_key": "scheduleValue", "min": 16, "max": 24, "description": "AHU supply air temperature setpoint [°C]"}
         }
     },
     "observations": {
