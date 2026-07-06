@@ -24,9 +24,16 @@ PLOTS_DIR = os.path.join(SCRIPT_DIR, "plots")
 STEP_SIZE = 600        # seconds
 EPISODE_STEPS = int(3600 * 24 * 5 / STEP_SIZE)   # 5-day episodes
 
-# Comfort band: no per-room control, so comfort is measured against a fixed
-# building-wide heating setpoint. Shared between the reward (skoven_RL_control)
-# and the eval/baseline KPI computation so they can't drift apart.
+# Comfort is a RANGE [COMFORT_MIN_C, COMFORT_MAX_C], not a fixed point: the
+# supervisory RL controller emits per-room indoor-temperature setpoints and is
+# only asked to keep every room inside this band while minimising energy.
+# Excursions BELOW the min and ABOVE the max are both penalised (two-sided).
+# Shared between the reward (skoven_RL_control) and the eval/baseline KPI
+# computation so they can't drift apart.
+COMFORT_MIN_C = 19.0
+COMFORT_MAX_C = 26.0
+# Kept as the baseline target / plot reference (a sensible operating point
+# inside the band); the old fixed-setpoint reward/KPIs are superseded by the band.
 COMFORT_SETPOINT_C = 21.0
 COMFORT_DEADBAND_C = 0.2
 

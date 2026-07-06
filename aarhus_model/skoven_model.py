@@ -390,6 +390,33 @@ def hydronic_fcn(self, *, calibration_mode: bool = True) -> None:
         )
         setpoint_port = "scheduleValue"
 
+    # ----- Per-room indoor-temperature setpoints (sim / RL only) -------------
+    # Supervisory RL levers: the agent emits one indoor-temp setpoint per room.
+    # The shared radiator loop is driven by the MEAN of these via the outdoor-
+    # reset heating curve — computed live by SupervisorySetpointGymSimulator,
+    # which overrides ecl310_TSupSet_schedule (the PID/valve below are untouched).
+    # The per-room values also steer each room's VAV damper (per-room air trim).
+    # Each schedule is connected to a read-back sensor so the source stays in the
+    # connected graph and is available as an observation.
+    if not calibration_mode:
+        for zone_id in ZONES:
+            indoor_setpoint = tb.ScheduleSystem(
+                id=f"{zone_id}_indoor_temp_setpoint",
+                weekDayRulesetDict={
+                    "ruleset_default_value": 21.0,
+                    "ruleset_start_minute": [0], "ruleset_end_minute": [0],
+                    "ruleset_start_hour": [0], "ruleset_end_hour": [24],
+                    "ruleset_value": [21.0],
+                },
+            )
+            indoor_setpoint_readback = tb.SensorSystem(
+                id=f"{zone_id}_indoor_temp_setpoint_readback"
+            )
+            self.add_connection(
+                indoor_setpoint, indoor_setpoint_readback,
+                "scheduleValue", "measuredValue",
+            )
+
     # ----- ECL310 PID + primary mixing valve ---------------------------------
     # Reverse-acting: open the primary valve when the supply is BELOW the curve
     # setpoint (too cold). Direct action would close the valve when cold.

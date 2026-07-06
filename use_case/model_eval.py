@@ -28,7 +28,7 @@ sys.path.append(MAIN_DIR)
 
 from aarhus_model.skoven_model import load_model_and_params, ZONES
 from use_case.rl_config import (
-    POLICY_CONFIG_PATH, PLOTS_DIR, COMFORT_SETPOINT_C, COMFORT_DEADBAND_C,
+    POLICY_CONFIG_PATH, PLOTS_DIR, COMFORT_SETPOINT_C, COMFORT_MIN_C, COMFORT_MAX_C,
     load_rl_windows, dst_safe_chunks,
 )
 
@@ -210,7 +210,8 @@ def plot_results(simulator: tb.Simulator, rewards=None, plotting_stepSize=600,
 
         plt.figure(figsize=(12, 6))
         plt.plot(temp.index, temp.values, label="Indoor Temperature", linewidth=2)
-        plt.axhline(COMFORT_SETPOINT_C, linestyle="--", color="grey", label="Comfort setpoint")
+        plt.axhline(COMFORT_MIN_C, linestyle="--", color="tab:blue", label="Comfort band")
+        plt.axhline(COMFORT_MAX_C, linestyle="--", color="tab:red")
         plt.title(f"{zone_id} — Temperature")
         plt.xlabel("Time")
         plt.ylabel("Temperature (°C)")
@@ -222,18 +223,18 @@ def plot_results(simulator: tb.Simulator, rewards=None, plotting_stepSize=600,
             plt.savefig(os.path.join(plots_dir, f"{zone_id}_temperature_setpoint.png"))
         plt.close()
 
-    # --- Comfort KPIs: degree-hours below (setpoint - deadband), % time in band ---
-    band = COMFORT_SETPOINT_C - COMFORT_DEADBAND_C
+    # --- Comfort KPIs: two-sided degree-hours outside [MIN,MAX], % time in band ---
     print("\n--- Comfort KPIs ---")
     total_degree_hours = 0.0
     total_in_band_frac = []
     for zone_id, T in zone_temp_raw.items():
-        viol_degC = np.maximum(0.0, band - T)
+        viol_degC = np.maximum(0.0, COMFORT_MIN_C - T) + np.maximum(0.0, T - COMFORT_MAX_C)
         degree_hours = float(np.sum(viol_degC) * dt_hours)
-        in_band_pct = float(np.mean(T >= band) * 100.0)
+        in_band_pct = float(np.mean((T >= COMFORT_MIN_C) & (T <= COMFORT_MAX_C)) * 100.0)
         total_degree_hours += degree_hours
         total_in_band_frac.append(in_band_pct)
-        print(f"  {zone_id}: {degree_hours:8.2f} °C·h below {band:.1f}°C, "
+        print(f"  {zone_id}: {degree_hours:8.2f} °C·h outside "
+              f"[{COMFORT_MIN_C:.0f},{COMFORT_MAX_C:.0f}]°C, "
               f"{in_band_pct:5.1f}% of timesteps in band")
     print(f"  TOTAL: {total_degree_hours:8.2f} °C·h, "
           f"{np.mean(total_in_band_frac):5.1f}% mean time in band")

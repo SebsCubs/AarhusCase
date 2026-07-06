@@ -1,25 +1,20 @@
 {
-    "_actions_note": "Action space = shared hydronic supply-water setpoint (ecl310_TSupSet_schedule) + 4 per-room VAV dampers ({zone}_supply_damper.damperPosition). The dampers are OVERSIZED by AHU_DEFAULTS['vav_oversize_factor'] (fully open = 2x the 3-ACH design flow); each has its own `{zone}_damper_position` baseline schedule holding the design 3-ACH for the rule-based baseline / non-RL fallback (so baseline AHU energy is unchanged), which the gym's per-step input override supersedes during RL. Rationale: a single shared supply-water temp couldn't hold the coldest room (room_a) without overheating b/c/d and wasting heat; independent per-room damper control lets the agent boost warm supply air into room_a and trim the others. The AHU supply-air TEMP setpoint stays plant-controlled (economizer), not an RL action.",
+    "_actions_note": "SUPERVISORY setpoint control (see docs/RL_CONTROL_PLAN_V2.md). Action space = 4 per-room indoor-temperature setpoints ({zone}_indoor_temp_setpoint.scheduleValue) + 1 global supply-air-temperature setpoint (supply_air_temp_setpoint_sensor.scheduleValue). SupervisorySetpointGymSimulator turns these into low-level signals each step: the shared radiator loop tracks the MEAN of the 4 indoor setpoints via the outdoor-reset heating curve (writes ecl310_TSupSet_schedule → the untouched ECL310 PID/valve); the supply-air setpoint drives the coil/HR with the economizer as a cooling-only safety floor; and each room's VAV damper opens above its 3-ACH baseline (rule-driven, NOT an RL action) to trim the room toward its own setpoint when the supply air is on the helpful side. Comfort is a RANGE [19,26] °C (two-sided). The direct supply-water setpoint and direct damper actions from earlier versions are removed.",
     "actions": {
-        "ecl310_TSupSet_schedule": {
-            "scheduleValue": {
-                "signal_key": "scheduleValue",
-                "min": 20,
-                "max": 70,
-                "description": "Supply water temperature SETPOINT [°C] tracked by the ECL310 PID (the single hydronic control lever; the PID modulates the mixing valve to hit it)"
-            }
+        "room_a_indoor_temp_setpoint": {
+            "scheduleValue": {"signal_key": "scheduleValue", "min": 18, "max": 26, "description": "Room A indoor-temperature setpoint [°C]. Hydronic loop uses the MEAN of the 4 room setpoints (heating curve → supply-water setpoint → ECL310 PID); the air loop trims room A toward this value."}
         },
-        "room_a_supply_damper": {
-            "damperPosition": {"signal_key": "damperPosition", "min": 0.1, "max": 1.0, "description": "Room A VAV damper position [0-1] on the OVERSIZED damper (baseline u≈0.58 = 3-ACH; up to 1.0 = 2x design). Boosts/throttles warm supply-air delivery to room A."}
+        "room_b_indoor_temp_setpoint": {
+            "scheduleValue": {"signal_key": "scheduleValue", "min": 18, "max": 26, "description": "Room B indoor-temperature setpoint [°C] (see room A)."}
         },
-        "room_b_supply_damper": {
-            "damperPosition": {"signal_key": "damperPosition", "min": 0.1, "max": 1.0, "description": "Room B VAV damper position [0-1] (oversized; baseline u = 3-ACH, 1.0 = 2x design)."}
+        "room_c_indoor_temp_setpoint": {
+            "scheduleValue": {"signal_key": "scheduleValue", "min": 18, "max": 26, "description": "Room C indoor-temperature setpoint [°C] (see room A)."}
         },
-        "room_c_supply_damper": {
-            "damperPosition": {"signal_key": "damperPosition", "min": 0.1, "max": 1.0, "description": "Room C VAV damper position [0-1] (oversized; baseline u = 3-ACH, 1.0 = 2x design)."}
+        "room_d_indoor_temp_setpoint": {
+            "scheduleValue": {"signal_key": "scheduleValue", "min": 18, "max": 26, "description": "Room D indoor-temperature setpoint [°C] (see room A)."}
         },
-        "room_d_supply_damper": {
-            "damperPosition": {"signal_key": "damperPosition", "min": 0.1, "max": 1.0, "description": "Room D VAV damper position [0-1] (oversized; baseline u = 3-ACH, 1.0 = 2x design)."}
+        "supply_air_temp_setpoint_sensor": {
+            "scheduleValue": {"signal_key": "scheduleValue", "min": 14, "max": 30, "description": "Global AHU supply-air-temperature setpoint [°C] (coil/heat-recovery target). Economizer can force it cooler as a safety floor when the building overshoots."}
         }
     },
     "observations": {
@@ -76,6 +71,18 @@
         },
         "room_d_supply_damper": {
             "airFlowRate": {"signal_key": "airFlowRate", "min": 0, "max": 1.0, "description": "Room D current supply airflow [kg/s]"}
+        },
+        "room_a_indoor_temp_setpoint_readback": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 18, "max": 26, "description": "Room A indoor-temp setpoint currently applied [°C] (the agent's own last action)"}
+        },
+        "room_b_indoor_temp_setpoint_readback": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 18, "max": 26, "description": "Room B indoor-temp setpoint currently applied [°C]"}
+        },
+        "room_c_indoor_temp_setpoint_readback": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 18, "max": 26, "description": "Room C indoor-temp setpoint currently applied [°C]"}
+        },
+        "room_d_indoor_temp_setpoint_readback": {
+            "measuredValue": {"signal_key": "measuredValue", "min": 18, "max": 26, "description": "Room D indoor-temp setpoint currently applied [°C]"}
         }
     },
     "time_embeddings": {

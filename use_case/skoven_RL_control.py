@@ -35,11 +35,16 @@ from stable_baselines3.common.monitor import Monitor
 from t4b_gym.t4b_gym_env import (
     T4BGymEnv, GymSimulator, NormalizedObservationWrapper, NormalizedActionWrapper,
 )
-from aarhus_model.skoven_model import load_model_and_params, ZONES, AHU_DEFAULTS
+from aarhus_model.skoven_model import (
+    load_model_and_params, ZONES, AHU_DEFAULTS,
+    zone_ventilation_flow, damper_position_for_flow,
+)
+from aarhus_model.heating_curve import compute_supply_setpoint
 from use_case.model_eval import test_model_chunked
 from use_case.rl_config import (
     TZ, POLICY_CONFIG_PATH, LOG_DIR, CHECKPOINT_DIR, STEP_SIZE, EPISODE_STEPS,
-    COMFORT_SETPOINT_C, COMFORT_DEADBAND_C, load_rl_windows, dst_excluding_periods,
+    COMFORT_MIN_C, COMFORT_MAX_C, load_rl_windows, dst_excluding_periods,
+    load_building_config,
 )
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -52,74 +57,177 @@ TRAIN_START, TRAIN_END, EVAL_START, EVAL_END = load_rl_windows()
 TRAIN_EXCLUDING_PERIODS = dst_excluding_periods(TRAIN_START, TRAIN_END, EPISODE_STEPS, STEP_SIZE)
 
 
-class EconomizerGymSimulator(GymSimulator):
-    """Plant-level AHU economizer (free cooling).
+class SupervisorySetpointGymSimulator(GymSimulator):
+    """Supervisory-setpoint plant controller.
 
-    Each timestep, right after the AHU supply-air setpoint schedule steps — and
-    before the coil / heat-recovery read it (the schedule is a source, so it
-    steps first in the execution order) — override the setpoint with a free-
-    cooling value whenever the building runs above setpoint+deadband AND the
-    outdoor air is cooler. The AHU then supplies cool outdoor air (heat-recovery
-    bypass, since the same setpoint drives the HR target) down to a floor,
-    shedding the solar/internal gains the radiators can't remove.
+    The RL agent emits SETPOINTS, not actuator commands: 4 per-room indoor-temp
+    setpoints (`{zone}_indoor_temp_setpoint`) + 1 global supply-air-temp setpoint
+    (`supply_air_temp_setpoint_sensor`). This simulator turns those setpoints into
+    the low-level signals each step, leaving the ECL310 supply-water PID + mixing
+    valve untouched:
 
-    This is a property of the PLANT, so it applies to both the rule-based
-    baseline and the RL rollouts; it is NOT an RL action (the agent still only
-    controls the hydronic supply setpoint). Room feedback uses the previous
-    step's zone temps (1-step delay), standard for a supervisory controller.
+      1. HYDRONIC (shared radiators): the shared loop is driven by the MEAN of the
+         4 indoor setpoints through the existing outdoor-reset heating curve —
+         T_water = compute_supply_setpoint(T_oa, mean(Tset)). Written to
+         `ecl310_TSupSet_schedule`, which the PID then tracks (realistic: one
+         substation drives all radiators together).
+      2. SUPPLY AIR: the RL supply-air setpoint drives the coil/HR, with the
+         economizer kept as a SAFETY FLOOR (it can force the setpoint cooler when
+         the building overshoots, but never overrides the RL when it doesn't).
+      3. PER-ROOM AIR TRIM: each room's VAV damper opens above its 3-ACH baseline
+         to push the room toward its own setpoint, but only when the supply air is
+         on the helpful side (warm air to a cold room / cool air to a hot room).
+
+    All three are applied via the schedule-output-override pattern (write the
+    source schedule's output after it steps; consumers read it the same step). RL
+    setpoints are read from `control_inputs` (current action); T_oa and zone temps
+    are read from the previous step (1-step delay, standard for supervisory control).
     """
 
-    SETPOINT_COMPONENT = "supply_air_temp_setpoint_sensor"
+    ECL_SETPOINT_COMPONENT = "ecl310_TSupSet_schedule"
+    AIR_SETPOINT_COMPONENT = "supply_air_temp_setpoint_sensor"
+
+    # Economizer safety-floor params (reused from the AHU defaults).
     ECON_TARGET = float(AHU_DEFAULTS["supply_air_setpoint_C"])
     ECON_DEADBAND = float(AHU_DEFAULTS["economizer_deadband_C"])
     ECON_GAIN = float(AHU_DEFAULTS["economizer_gain"])
     ECON_MIN = float(AHU_DEFAULTS["cooling_min_supply_air_C"])
     ECON_ENABLED = bool(AHU_DEFAULTS["economizer_enabled"])
 
-    def _economizer_setpoint(self) -> float:
-        m = self.model
-        temps = []
+    # Per-room air-trim rule: once a room is more than DAMPER_DEADBAND off its
+    # setpoint (and the supply air is on the helpful side), its damper opens
+    # `K_DAMPER` per °C of *excess* error above its 3-ACH baseline, up to fully
+    # open (=2x design flow). The deadband keeps the dampers at the 3-ACH baseline
+    # for the small perpetual offset a room has from its setpoint (so the trim is a
+    # targeted correction, not a constant boost — and the fixed-21 baseline stays a
+    # ~3-ACH incumbent, not a ventilation-heavy one).
+    K_DAMPER = 0.4
+    DAMPER_DEADBAND = 0.5
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-room air trim is the RL controller's innovation; the rule-based
+        # baseline disables it (dampers stay at their 3-ACH position) so it is a
+        # conventional incumbent — outdoor-reset hydronic + constant ventilation.
+        self.trim_enabled = True
+        cfg = load_building_config()
+        hc = cfg.get("heating_curve", {})
+        self._hc_s = float(hc.get("s", 1.2))
+        self._hc_b = float(hc.get("b", 23.6))
+        self._hc_delta = float(hc.get("delta", 0.0))
+        self._hc_tmin = float(hc.get("T_min", 20.0))
+        self._hc_tmax = float(hc.get("T_max", 80.0))
+        # Baseline damper position (the u that reproduces 3-ACH on the oversized
+        # damper) per room, and the map from damper-schedule id -> zone.
+        ach = float(AHU_DEFAULTS["ventilation_ach"])
+        oversize = float(AHU_DEFAULTS["vav_oversize_factor"])
+        a = float(AHU_DEFAULTS["damper_a"])
+        self._base_pos = {}
+        self._damper_pos_components = {}
         for z in ZONES:
-            comp = m.components.get(f"{z}_indoor_temp_sensor")
-            if comp is None:
-                continue
-            v = comp.output["measuredValue"].get()
-            if v is not None and np.isfinite(float(v)):
-                temps.append(float(v))
-        if not temps:
-            return self.ECON_TARGET
+            design = zone_ventilation_flow(z, ach)
+            self._base_pos[z] = damper_position_for_flow(design, oversize * design, a)
+            self._damper_pos_components[f"{z}_damper_position"] = z
+
+    # --- helpers -----------------------------------------------------------
+    def _rl_value(self, component_id, signal, default):
+        """Current RL action value for a signal (control_inputs holds scalars once
+        an action has been applied; a dict/None means not yet set → default)."""
+        v = self.control_inputs.get(component_id, {}).get(signal, default)
+        if isinstance(v, dict) or v is None:
+            return float(default)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _outdoor_temp(self) -> float:
+        v = self.model.components["outdoor_environment"].output["outdoorTemperature"].get()
+        return float(v) if v is not None and np.isfinite(float(v)) else 0.0
+
+    def _prev_zone_temp(self, zone) -> float:
+        comp = self.model.components.get(f"{zone}_indoor_temp_sensor")
+        v = comp.output["measuredValue"].get() if comp is not None else None
+        return float(v) if v is not None and np.isfinite(float(v)) else 21.0
+
+    def _indoor_setpoint(self, zone) -> float:
+        return self._rl_value(f"{zone}_indoor_temp_setpoint", "scheduleValue", 21.0)
+
+    def _economizer_setpoint(self) -> float:
+        """Free-cooling supply-air setpoint (= ECON_TARGET unless the building
+        overshoots and outdoor is cooler, in which case a lower, floored value)."""
+        temps = [self._prev_zone_temp(z) for z in ZONES]
         T_room = sum(temps) / len(temps)
-        T_oa = float(m.components["outdoor_environment"].output["outdoorTemperature"].get())
+        T_oa = self._outdoor_temp()
         overshoot = T_room - self.ECON_TARGET
         if np.isfinite(T_oa) and overshoot > self.ECON_DEADBAND and T_oa < T_room:
-            # Proportional free cooling: drop the supply-air setpoint below 21 in
-            # proportion to the mean-room overshoot (past the deadband), floored.
-            # Only free while the floor stays above outdoor temp (heat-recovery
-            # bypass); the coil trims the rest.
             setpoint = self.ECON_TARGET - self.ECON_GAIN * (overshoot - self.ECON_DEADBAND)
             return float(min(max(setpoint, self.ECON_MIN), self.ECON_TARGET))
         return self.ECON_TARGET
 
+    def _supply_air_setpoint(self) -> float:
+        """RL supply-air setpoint, with the economizer as a cooling-only floor."""
+        rl_val = self._rl_value(self.AIR_SETPOINT_COMPONENT, "scheduleValue", self.ECON_TARGET)
+        if not self.ECON_ENABLED:
+            return rl_val
+        econ = self._economizer_setpoint()
+        # Only clamp when the economizer is actively demanding cooling (overshoot);
+        # otherwise the RL fully owns the setpoint (including calling for heat).
+        return min(rl_val, econ) if econ < self.ECON_TARGET else rl_val
+
+    def _supply_water_setpoint(self) -> float:
+        T_ref = sum(self._indoor_setpoint(z) for z in ZONES) / len(ZONES)
+        return compute_supply_setpoint(
+            T_oa=self._outdoor_temp(), T_room_ref=T_ref,
+            s=self._hc_s, b=self._hc_b, delta=self._hc_delta,
+            T_min=self._hc_tmin, T_max=self._hc_tmax,
+        )
+
+    def _damper_position(self, zone) -> float:
+        if not self.trim_enabled:
+            return self._base_pos[zone]
+        T_set = self._indoor_setpoint(zone)
+        T_room = self._prev_zone_temp(zone)
+        T_air = self._supply_air_setpoint()
+        base = self._base_pos[zone]
+        err = T_set - T_room                       # >0: room wants to be warmer
+        excess = max(0.0, abs(err) - self.DAMPER_DEADBAND)
+        helpful = (err > 0 and T_air > T_room) or (err < 0 and T_air < T_room)
+        if excess > 0.0 and helpful:               # meaningful deviation + air helps
+            pos = base + self.K_DAMPER * excess
+        else:                                       # in deadband or air can't help
+            pos = base
+        return float(min(max(pos, base), 1.0))
+
+    @staticmethod
+    def _write_output(component, signal, value, step_index):
+        out = component.output[signal]
+        fv = float(value)
+        out._tensor[:] = fv
+        if getattr(out, "_log_history", False):
+            out._history[step_index] = fv
+
     def _do_component_timestep(self, component, second_time, date_time, step_size, step_index):
         super()._do_component_timestep(component, second_time, date_time, step_size, step_index)
-        if (self.ECON_ENABLED and component.id == self.SETPOINT_COMPONENT
-                and "scheduleValue" in component.output):
-            val = self._economizer_setpoint()
-            out = component.output["scheduleValue"]
-            out._tensor[:] = val
-            if getattr(out, "_log_history", False):
-                out._history[step_index] = val
+        cid = component.id
+        if cid == self.ECL_SETPOINT_COMPONENT and "scheduleValue" in component.output:
+            self._write_output(component, "scheduleValue", self._supply_water_setpoint(), step_index)
+        elif cid == self.AIR_SETPOINT_COMPONENT and "scheduleValue" in component.output:
+            self._write_output(component, "scheduleValue", self._supply_air_setpoint(), step_index)
+        elif cid in self._damper_pos_components and "scheduleValue" in component.output:
+            zone = self._damper_pos_components[cid]
+            self._write_output(component, "scheduleValue", self._damper_position(zone), step_index)
 
 
 class SkovenGymEnv(T4BGymEnv):
     """Custom reward for the Skoven hydronic building model."""
 
-    simulator_class = EconomizerGymSimulator
+    simulator_class = SupervisorySetpointGymSimulator
 
-    # Reward weights. temp_violation already grows sharply (heating_viol +
-    # exp(heating_viol)-1, per zone), so W_COMFORT just sets how hard comfort
-    # dominates energy; LAMBDA_ENERGY weights the (gated) heat+AHU term in kW;
-    # REWARD_SCALE keeps the per-step reward O(1) for a well-conditioned value
+    # Reward weights. temp_violation already grows sharply (viol + exp(viol)-1,
+    # per zone, two-sided about the [19,26] band), so W_COMFORT just sets how hard
+    # comfort dominates energy; LAMBDA_ENERGY weights the (gated) heat+AHU term in
+    # kW; REWARD_SCALE keeps the per-step reward O(1) for a well-conditioned value
     # function.
     W_COMFORT = 10.0
     LAMBDA_ENERGY = 1.0
@@ -142,27 +250,26 @@ class SkovenGymEnv(T4BGymEnv):
             except Exception:
                 return default
 
-    # Comfort band (shared with model_eval.py/baseline_eval.py KPIs via
-    # rl_config so the reward and the reported KPIs can't drift apart). A
-    # small deadband avoids penalizing sub-tolerance sensor/solver noise.
-    COMFORT_SETPOINT = COMFORT_SETPOINT_C
-    COMFORT_DEADBAND = COMFORT_DEADBAND_C
+    # Comfort RANGE [min, max] (shared with model_eval.py/baseline_eval.py KPIs
+    # via rl_config so the reward and the reported KPIs can't drift apart).
+    # Excursions below the min and above the max are both penalised.
+    COMFORT_MIN = COMFORT_MIN_C
+    COMFORT_MAX = COMFORT_MAX_C
 
     def get_reward(self, observations, action):
         model = self.simulator.model
 
-        # --- Thermal comfort violations (per room vs the comfort setpoint) ---
+        # --- Thermal comfort violations (per room vs the comfort RANGE) ---
+        # Two-sided: penalise below COMFORT_MIN AND above COMFORT_MAX. A room can
+        # only violate one bound at a time, so `viol` is whichever excursion is
+        # non-zero. `exp(viol) - 1` grows sharply on a real excursion but is
+        # exactly 0 inside the band, so comfort_ok is reachable and the energy
+        # signal survives (the fix that made comfort learnable in v3).
         temp_violation_total = 0.0
         for zone_id in ZONES:
             T_zone = self._val(model.components[f"{zone_id}_indoor_temp_sensor"], "measuredValue")
-            heating_viol = max(0.0, (self.COMFORT_SETPOINT - self.COMFORT_DEADBAND) - T_zone)
-            # Sharp, asymmetric comfort penalty that is exactly 0 when the room is
-            # comfortable. The earlier `exp(1 + heating_viol)` added a constant e¹
-            # per zone even at zero violation (a 4·e¹ = 10.873 floor), which made
-            # comfort_ok structurally impossible and swamped the energy terms so the
-            # agent just maxed heating. `exp(x) - 1` keeps the sharp growth on a real
-            # dip but vanishes at heating_viol = 0, restoring the energy signal.
-            temp_violation_total += heating_viol + (np.exp(heating_viol) - 1.0)
+            viol = max(0.0, self.COMFORT_MIN - T_zone) + max(0.0, T_zone - self.COMFORT_MAX)
+            temp_violation_total += viol + (np.exp(viol) - 1.0)
 
         # --- District heating power [kW] ---
         # In calibration mode a measured varme sensor exists; in simulation mode

@@ -57,38 +57,22 @@ def _mean_room_temp_C(env) -> float:
     return sum(temps) / len(temps)
 
 
-def _run_curve_segment(env, hc, low, high, seg_start, seg_end, plots_dir, save_plots):
-    """Drive the outdoor-reset curve over one DST-safe segment on the
-    (already-built, reused) env."""
+def _run_baseline_segment(env, action_norm, seg_start, seg_end, plots_dir, save_plots):
+    """Run the constant-setpoint incumbent over one DST-safe segment on the
+    (already-built, reused) env. The supervisory cascade in
+    SupervisorySetpointGymSimulator turns the fixed setpoints into supply-water
+    (mean setpoint → heating curve → ECL310 PID), supply-air (with economizer
+    floor), and the per-room damper trim — so the baseline uses the SAME plant
+    path as the RL policy, just with a constant action."""
     episode_length = int((seg_end - seg_start).total_seconds() / env.unwrapped.step_size)
     env.unwrapped.random_start = False
     env.unwrapped.global_start_time = seg_start
     env.unwrapped.episode_length = episode_length
 
-    # ECL310 room-compensation gain [°C supply per °C room error]: the incumbent
-    # controller trims the outdoor-reset supply setpoint down when the building
-    # runs warm (and up when cold). Without it a pure outdoor-reset curve has no
-    # room feedback — the fixed-position radiator valves can't self-regulate, so
-    # zones drift up through spring as the envelope loss falls (see the analysis
-    # in the model-eval discussion / scripts/diag_curve_fit.py).
-    K = float(hc.get("room_comp_k", 4.0))
-
     obs, _ = env.reset()
     rewards = []
     print(f"Simulating rule-based baseline {seg_start} -> {seg_end} ({episode_length} steps)...")
     for _ in range(episode_length):
-        T_oa = _outdoor_temp_C(env)
-        T_room = _mean_room_temp_C(env)
-        T_set = compute_supply_setpoint(
-            T_oa=T_oa, T_room_ref=COMFORT_SETPOINT_C,
-            s=hc.get("s", 1.5), b=hc.get("b", 35.0), delta=hc.get("delta", 0.0),
-            T_min=hc.get("T_min", 20.0), T_max=hc.get("T_max", 80.0),
-        )
-        # Room compensation: pull the supply setpoint toward less heat when the
-        # building mean exceeds the comfort setpoint (and vice versa).
-        T_set -= K * (T_room - COMFORT_SETPOINT_C)
-        T_set = float(np.clip(T_set, low, high))
-        action_norm = np.array([2.0 * (T_set - low) / (high - low) - 1.0], dtype=np.float32)
         obs, reward, terminated, truncated, _ = env.step(action_norm)
         rewards.append(reward)
         if terminated or truncated:
@@ -100,8 +84,11 @@ def _run_curve_segment(env, hc, low, high, seg_start, seg_end, plots_dir, save_p
 
 def run_baseline(save_plots: bool = True, plots_dir: str = None,
                   eval_start=None, eval_end=None):
-    """Drive the rule-based outdoor-reset curve over the eval window and
-    report the same KPIs/plots as the RL rollout, for a like-for-like compare.
+    """Incumbent baseline: hold every indoor-temp setpoint AND the supply-air
+    setpoint at COMFORT_SETPOINT_C (21 °C) and run the SAME supervisory cascade
+    the RL policy uses, for a like-for-like compare (mean setpoint → outdoor-
+    reset curve → ECL310 PID; economizer floor; per-room damper trim, which for
+    equal setpoints sits at its 3-ACH baseline).
 
     eval_start/eval_end default to the shared config window (skoven.yaml) but
     can be overridden for a quick smoke-sized run. DST-safe: splits the
@@ -113,16 +100,23 @@ def run_baseline(save_plots: bool = True, plots_dir: str = None,
     if plots_dir is None:
         plots_dir = BASELINE_PLOTS_DIR
 
-    hc = load_building_config().get("heating_curve", {})
     if eval_start is None or eval_end is None:
         _, _, eval_start, eval_end = load_rl_windows()
 
     env = build_env(eval_start, eval_end, eval_mode=True, monitor_filename="baseline_monitor.csv")
+    # Conventional incumbent: outdoor-reset hydronic + constant 3-ACH ventilation
+    # (no per-room air trim — that is the RL controller's innovation).
+    env.unwrapped.simulator.trim_enabled = False
 
-    # Action space bounds (physical °C) for normalizing the curve's setpoint
-    # into the NormalizedActionWrapper's [-1, 1] input.
-    low = float(env.unwrapped.action_space.low[0])
-    high = float(env.unwrapped.action_space.high[0])
+    # Constant incumbent action: every setpoint (4 indoor + supply-air) = 21 °C,
+    # mapped per-dimension into the NormalizedActionWrapper's [-1, 1] input using
+    # the physical action-space bounds.
+    low = env.unwrapped.action_space.low
+    high = env.unwrapped.action_space.high
+    target = np.full(low.shape, COMFORT_SETPOINT_C, dtype=np.float32)
+    action_norm = np.clip(
+        2.0 * (target - low) / (high - low) - 1.0, -1.0, 1.0
+    ).astype(np.float32)
 
     chunks = dst_safe_chunks(eval_start, eval_end)
     if len(chunks) > 1:
@@ -132,8 +126,8 @@ def run_baseline(save_plots: bool = True, plots_dir: str = None,
     kpi_list, weights = [], []
     for i, (seg_start, seg_end) in enumerate(chunks):
         seg_dir = plots_dir if len(chunks) == 1 else f"{plots_dir}_seg{i}"
-        _, kpis = _run_curve_segment(env, hc, low, high, seg_start, seg_end,
-                                      seg_dir if save_plots else None, save_plots)
+        _, kpis = _run_baseline_segment(env, action_norm, seg_start, seg_end,
+                                        seg_dir if save_plots else None, save_plots)
         kpi_list.append(kpis)
         weights.append((seg_end - seg_start).total_seconds())
 
