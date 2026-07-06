@@ -21,6 +21,7 @@ import numpy as np
 from stable_baselines3 import PPO
 
 from aarhus_model.heating_curve import compute_supply_setpoint
+from aarhus_model.skoven_model import ZONES
 from use_case.model_eval import plot_results, aggregate_kpis, test_model_chunked
 from use_case.rl_config import (
     LOG_DIR, PLOTS_DIR, COMFORT_SETPOINT_C, load_building_config, load_rl_windows,
@@ -31,13 +32,29 @@ from use_case.skoven_RL_control import build_env
 BASELINE_PLOTS_DIR = PLOTS_DIR + "_baseline"
 
 
+def _read_output(component, port, default=0.0) -> float:
+    out = component.output[port]
+    v = out.get() if hasattr(out, "get") else out
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _outdoor_temp_C(env) -> float:
     """Current outdoor air temperature, read directly off the model (same
     pattern SkovenGymEnv.get_reward uses for live state reads)."""
     model = env.unwrapped.simulator.model
-    out = model.components["outdoor_environment"].output["outdoorTemperature"]
-    v = out.get() if hasattr(out, "get") else out
-    return float(v)
+    return _read_output(model.components["outdoor_environment"], "outdoorTemperature")
+
+
+def _mean_room_temp_C(env) -> float:
+    """Building-wide mean indoor temperature (the ECL310 room-compensation
+    reference), read live off the four zone sensors."""
+    model = env.unwrapped.simulator.model
+    temps = [_read_output(model.components[f"{z}_indoor_temp_sensor"], "measuredValue",
+                          COMFORT_SETPOINT_C) for z in ZONES]
+    return sum(temps) / len(temps)
 
 
 def _run_curve_segment(env, hc, low, high, seg_start, seg_end, plots_dir, save_plots):
@@ -48,16 +65,28 @@ def _run_curve_segment(env, hc, low, high, seg_start, seg_end, plots_dir, save_p
     env.unwrapped.global_start_time = seg_start
     env.unwrapped.episode_length = episode_length
 
+    # ECL310 room-compensation gain [°C supply per °C room error]: the incumbent
+    # controller trims the outdoor-reset supply setpoint down when the building
+    # runs warm (and up when cold). Without it a pure outdoor-reset curve has no
+    # room feedback — the fixed-position radiator valves can't self-regulate, so
+    # zones drift up through spring as the envelope loss falls (see the analysis
+    # in the model-eval discussion / scripts/diag_curve_fit.py).
+    K = float(hc.get("room_comp_k", 4.0))
+
     obs, _ = env.reset()
     rewards = []
     print(f"Simulating rule-based baseline {seg_start} -> {seg_end} ({episode_length} steps)...")
     for _ in range(episode_length):
         T_oa = _outdoor_temp_C(env)
+        T_room = _mean_room_temp_C(env)
         T_set = compute_supply_setpoint(
             T_oa=T_oa, T_room_ref=COMFORT_SETPOINT_C,
             s=hc.get("s", 1.5), b=hc.get("b", 35.0), delta=hc.get("delta", 0.0),
             T_min=hc.get("T_min", 20.0), T_max=hc.get("T_max", 80.0),
         )
+        # Room compensation: pull the supply setpoint toward less heat when the
+        # building mean exceeds the comfort setpoint (and vice versa).
+        T_set -= K * (T_room - COMFORT_SETPOINT_C)
         T_set = float(np.clip(T_set, low, high))
         action_norm = np.array([2.0 * (T_set - low) / (high - low) - 1.0], dtype=np.float32)
         obs, reward, terminated, truncated, _ = env.step(action_norm)

@@ -23,6 +23,7 @@ CALIBRATION vs SIMULATION mode (calibration_mode flag):
 
 Reference: T4BGymUseCase/boptest_model/rooms_and_ahu_model.py
 """
+import math
 import os
 from typing import Callable, Optional
 
@@ -52,6 +53,16 @@ MODELS_DIR = os.path.join(SCRIPT_DIR, "generated_files", "models")
 ENVELOPE_RESULT_PICKLE = os.path.join(MODELS_DIR, "skoven_envelope_estimation", "result.pickle")
 HYDRONIC_RESULT_PICKLE = os.path.join(MODELS_DIR, "skoven_hydronic_estimation", "result.pickle")
 AHU_RESULT_PICKLE = os.path.join(MODELS_DIR, "skoven_ahu_estimation", "result.pickle")
+
+# Radiator energy-balance sizing (compute_winter_sizing) is NOT stored in the
+# estimation pickles — Q_flow_nominal_sh / T_*_nominal_sh / radiator flow are
+# plain floats, not tps.Parameters. It must therefore be re-applied at every
+# model build (load_model_and_params), or the radiators fall back to their
+# oversized construction defaults (~12x too much heat, zones run away to ~35 C).
+# The sizing is deterministic given the winter window, so it is computed once
+# (a 9-iteration bisection) and cached to JSON keyed on that window.
+HYDRONIC_SIZING_WINDOW = ("2026-01-08", "2026-01-15")  # winter heating regime (dT ~14 C)
+SIZING_CACHE_PATH = os.path.join(MODELS_DIR, "skoven_hydronic_estimation", "radiator_sizing.json")
 
 TZ = "Europe/Copenhagen"
 
@@ -118,6 +129,15 @@ def zone_ventilation_flow(zone_id: str, ach: float) -> float:
     volume_m3 = ZONES[zone_id]["floor_area_m2"] * ROOM_HEIGHT_M
     return ach * volume_m3 * RHO_AIR / 3600.0
 
+
+def damper_position_for_flow(target_flow: float, nominal_flow: float, a: float) -> float:
+    """Invert the DamperTorchSystem exponential characteristic
+    m = a·exp(b·u) − a  (b = log((nominal+a)/a), so m=nominal at u=1, m=0 at u=0)
+    to find the damper position u∈[0,1] that delivers `target_flow`. Used to
+    position an OVERSIZED damper at its 3-ACH design flow for the baseline."""
+    b = math.log((nominal_flow + a) / a)
+    return math.log((target_flow + a) / a) / b
+
 # Per-radiator nominal rating PRIORS. These set the (non-AD-calibratable) UA via
 # the SpaceHeaterTorchSystem nominal-output solve. They are only the build-time
 # priors: Stage 2 overrides them per-room via compute_winter_sizing() +
@@ -163,6 +183,19 @@ AHU_DEFAULTS = {
     "ventilation_ach": 3.0,        # air-changes/hour (Danish reg.) per room
     "supply_air_setpoint_C": 21.0, # sim-mode (RL) supply-air set-point default;
                                    # calibration mode tracks the room temp (neutral)
+    # Economizer / free cooling (sim mode only, applied live by the gym's
+    # EconomizerGymSimulator). When the building runs above setpoint+deadband and
+    # the outdoor air is cooler, the AHU supplies cool outdoor air (heat-recovery
+    # bypass) down to a floor, shedding solar/internal gains that the radiators
+    # can't remove. Without it the well-insulated rooms free-float to ~26 C in
+    # spring (irradiation 6x winter, radiators already at minimum).
+    "economizer_enabled": True,
+    "economizer_deadband_C": 0.5,      # engage cooling above setpoint + this
+    "economizer_gain": 3.0,            # °C supply drop per °C mean-room overshoot
+                                       # (proportional, so a small overshoot gives
+                                       # gentle cooling instead of full-floor blast)
+    "cooling_min_supply_air_C": 18.0,  # supply-air floor (draft/condensation +
+                                       # limits overcooling of the coolest room)
     "fan_nominal_flow_kgs": 1.5,
     "fan_nominal_power_W": 800.0,
     "fan_c1": 0.027828,
@@ -177,6 +210,16 @@ AHU_DEFAULTS = {
     "hr_primary_max_kgs": 1.5,
     "hr_secondary_max_kgs": 1.5,
     "damper_a": 0.5,
+    # Per-room VAV under RL control (sim mode): the dampers are OVERSIZED by this
+    # factor so that fully open (damperPosition=1) delivers vav_oversize_factor ×
+    # the room's 3-ACH design flow — giving the RL agent real authority to BOOST
+    # warm supply air (21 °C) into an under-heated room (room_a) above the
+    # baseline, not just throttle below it. The baseline / non-RL fallback keeps
+    # exactly 3-ACH via per-room `{zone}_damper_position` schedules positioned at
+    # the (oversize-corrected) u that reproduces the design flow, so baseline AHU
+    # energy and ventilation are unchanged; only the RL agent's boost costs extra
+    # fan/coil energy (which the reward penalises when the room is comfortable).
+    "vav_oversize_factor": 2.0,
 }
 
 
@@ -524,39 +567,46 @@ def ahu_fcn(self, *, calibration_mode: bool = True) -> None:
         supply_fan, supply_heating_coil, "outletAirTemperature", "inletAirTemperature"
     )
 
-    # Baseline VAV position: fully open at the design (3-ACH) flow. Wired
-    # UNCONDITIONALLY (both modes) so the air loop always has a sane default —
-    # dampers were previously inert in sim mode whenever a component wasn't also
-    # listed as an RL action (unconnected input defaults to 0 flow, silently
-    # starving ventilation). The gym's per-step input override
-    # (`_do_component_timestep` step 2 in t4b_gym_env.py) runs AFTER this
-    # connection is assigned, so an RL action on `damperPosition` still wins
-    # whenever the policy config includes it; this schedule is only the fallback
-    # for dampers the RL agent doesn't control.
-    vav_fixed_position = tb.ScheduleSystem(
-        id="vav_fixed_position",
-        weekDayRulesetDict={
-            "ruleset_default_value": 1.0,
-            "ruleset_start_minute": [0],
-            "ruleset_end_minute": [0],
-            "ruleset_start_hour": [0],
-            "ruleset_end_hour": [24],
-            "ruleset_value": [1.0],
-        },
-    )
-
+    # Per-room VAV dampers under (optional) RL control. Each damper is OVERSIZED
+    # by vav_oversize_factor so fully open delivers that multiple of the room's
+    # 3-ACH design flow — headroom for the agent to BOOST warm supply air into an
+    # under-heated room above baseline. Each damper gets its OWN position schedule
+    # (`{zone}_damper_position`) positioned at the u that reproduces the 3-ACH
+    # design flow on the oversized characteristic, so the rule-based baseline /
+    # non-RL fallback delivers exactly 3-ACH (unchanged AHU energy & ventilation).
+    # The schedules are wired UNCONDITIONALLY so the air loop always has a sane
+    # default (an unconnected damper input defaults to 0 flow, silently starving
+    # ventilation). The gym's per-step input override (`_do_component_timestep`
+    # step 2 in t4b_gym_env.py) runs AFTER this connection is assigned, so an RL
+    # action on `{zone}_supply_damper.damperPosition` still wins whenever the
+    # policy config lists it; these schedules are the fallback otherwise.
     ach = AHU_DEFAULTS["ventilation_ach"]
+    oversize = AHU_DEFAULTS["vav_oversize_factor"]
+    damper_a = AHU_DEFAULTS["damper_a"]
     for slot, (zone_id, cfg) in enumerate(ZONES.items()):
-        # Size the damper so fully open delivers the room's 3-ACH design flow.
+        design_flow = zone_ventilation_flow(zone_id, ach)
+        nominal_flow = oversize * design_flow
         zone_damper = DamperTorchSystem(
             id=f"{zone_id}_supply_damper",
-            nominalAirFlowRate=zone_ventilation_flow(zone_id, ach),
-            a=AHU_DEFAULTS["damper_a"],
+            nominalAirFlowRate=nominal_flow,
+            a=damper_a,
         )
         zone = self.components[zone_id]
 
+        base_pos = damper_position_for_flow(design_flow, nominal_flow, damper_a)
+        zone_damper_position = tb.ScheduleSystem(
+            id=f"{zone_id}_damper_position",
+            weekDayRulesetDict={
+                "ruleset_default_value": base_pos,
+                "ruleset_start_minute": [0],
+                "ruleset_end_minute": [0],
+                "ruleset_start_hour": [0],
+                "ruleset_end_hour": [24],
+                "ruleset_value": [base_pos],
+            },
+        )
         self.add_connection(
-            vav_fixed_position, zone_damper, "scheduleValue", "damperPosition"
+            zone_damper_position, zone_damper, "scheduleValue", "damperPosition"
         )
 
         # Damper aggregates total fan flow demand (Vector input)
@@ -815,6 +865,41 @@ def apply_energy_balance_sizing(model, sizing: dict) -> None:
                   m_per_rad=sizing["m_per_rad"])
 
 
+def get_or_compute_sizing(window=None, step: int = 600, cache_path: str = None,
+                          force: bool = False) -> dict:
+    """Return the radiator energy-balance sizing dict, from the JSON cache if it
+    matches the requested window, otherwise compute it (compute_winter_sizing)
+    and cache it. Keyed on the window so a changed window transparently
+    recomputes. Pass force=True to always recompute."""
+    import datetime
+    import json
+    from dateutil.tz import gettz
+
+    if window is None:
+        window = HYDRONIC_SIZING_WINDOW
+    if cache_path is None:
+        cache_path = SIZING_CACHE_PATH
+
+    if not force and os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                cached = json.load(f)
+            if cached.get("window") == list(window) and cached.get("step") == step:
+                return cached["sizing"]
+        except (json.JSONDecodeError, KeyError, OSError):
+            pass  # cache unreadable/stale — fall through to recompute
+
+    tz = gettz(TZ)
+    start = datetime.datetime.fromisoformat(window[0]).replace(tzinfo=tz)
+    end = datetime.datetime.fromisoformat(window[1]).replace(tzinfo=tz)
+    sizing = compute_winter_sizing(start, end, step=step)
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump({"window": list(window), "step": step, "sizing": sizing}, f, indent=2)
+    return sizing
+
+
 def fcn(self) -> None:
     """Default master fcn — calibration mode."""
     make_fcn(calibration_mode=True)(self)
@@ -848,9 +933,19 @@ def load_model_and_params(
     hydronic_pickle: Optional[str] = None,
     ahu_pickle: Optional[str] = None,
     calibration_mode: bool = False,
+    apply_sizing: bool = True,
 ) -> tb.Model:
     """Load Skoven model and apply calibrated parameter pickles. Defaults to
-    simulation mode (calibration_mode=False) so it's RL-ready."""
+    simulation mode (calibration_mode=False) so it's RL-ready.
+
+    The radiator energy-balance sizing (compute_winter_sizing) is applied
+    between the envelope and hydronic pickles — the same order as the
+    validation build (scripts/validation_plots.py). Without it the radiators
+    keep their oversized construction defaults and deliver ~12x too much heat,
+    so all zones run away to ~35 C (the sizing lives in Q_flow_nominal_sh /
+    radiator flow, which are plain floats and are NOT restored by the pickles).
+    Set apply_sizing=False only for diagnostics that want the raw defaults.
+    """
     model = get_model(calibration_mode=calibration_mode)
 
     if envelope_pickle is None:
@@ -860,7 +955,24 @@ def load_model_and_params(
     if ahu_pickle is None:
         ahu_pickle = AHU_RESULT_PICKLE
 
-    for pickle_path in [envelope_pickle, hydronic_pickle, ahu_pickle]:
+    # Envelope must be loaded before sizing (the bisection simulates the
+    # calibrated envelope); the hydronic pickle (PID gains + radiator thermal
+    # mass) is loaded after. Sizing must precede first initialize() — the
+    # SpaceHeaterTorchSystem freezes UA from the nominal rating on first init.
+    if os.path.exists(envelope_pickle):
+        model.load_estimation_result(envelope_pickle)
+    else:
+        print(f"Info: pickle not found yet — {envelope_pickle}")
+
+    if apply_sizing:
+        try:
+            sizing = get_or_compute_sizing()
+            apply_energy_balance_sizing(model, sizing)
+        except Exception as e:  # noqa: BLE001 — sizing needs winter-window CSVs
+            print(f"Warning: radiator sizing not applied ({e}); radiators will "
+                  f"use oversized construction defaults.")
+
+    for pickle_path in [hydronic_pickle, ahu_pickle]:
         if os.path.exists(pickle_path):
             model.load_estimation_result(pickle_path)
         else:

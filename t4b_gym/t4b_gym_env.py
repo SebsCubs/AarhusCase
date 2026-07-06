@@ -312,9 +312,14 @@ class T4BGymEnv(gym.Env):
     - reward_function (implemented by inheriting from the class and overriding the method)
 
     """
-    
-    def __init__(self, 
-                 model: tb.Model, 
+
+    # Simulator class used for stepping. Subclasses can override this to inject
+    # plant-level per-timestep logic (e.g. an economizer setting the AHU supply-
+    # air setpoint from live state) without touching the base env.
+    simulator_class = GymSimulator
+
+    def __init__(self,
+                 model: tb.Model,
                  io_config_file: str, # Mandatory for now
                  start_time: datetime = None,
                  end_time: datetime = None,
@@ -338,7 +343,7 @@ class T4BGymEnv(gym.Env):
             warmup_period: Number of steps to run before starting the episode (not implemented yet)
         """
         super().__init__()
-        self.simulator = GymSimulator(model)
+        self.simulator = self.simulator_class(model)
 
         # Set simulation parameters
         self.step_size = step_size

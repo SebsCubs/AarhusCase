@@ -63,13 +63,26 @@ export_start: "2024-06-01"
 export_end: "2026-06-01"
 # RL windows (calibrated-model simulation; sim mode only needs the weather
 # boundary CSVs, so these just need to sit inside export_start/export_end).
-# Disjoint train/eval split: eval covers the real Jan-2026 winter used for
-# Stage-2 hydronic calibration, so RL-vs-baseline results are directly
-# comparable to the calibrated operating point.
+# Disjoint WINTER/WINTER split: train on the 2024–25 heating season, eval on the
+# 2025–26 heating season (the one used for Stage-2 hydronic calibration), so
+# RL-vs-baseline results are directly comparable to the calibrated operating
+# point. Training is restricted to winter (not the full year) because in the
+# shoulder/summer months the radiators are off and the rooms free-float on solar
+# — the agent's supply-setpoint lever does nothing there, so those episodes carry
+# no learning signal for a heating controller (and only add off-distribution
+# noise). Both windows are DST-free (transitions are late March / late October).
 train_start: "2024-12-01"
-train_end: "2025-11-01"
+train_end: "2025-03-01"
+# Eval = HEATING SEASON only (Dec–Feb). In spring, well-insulated rooms with high
+# solar gain (c/d) want cooling while the low-gain room (a) still wants heat, at
+# the same time; a single shared supply-water + supply-air temp can't serve both,
+# so shared control necessarily sacrifices one room (see the baseline drift
+# analysis). Restricting eval to the heating season keeps the RL-vs-baseline
+# comparison on the regime the plant can actually control (all rooms want heat,
+# held ~21 °C). Also DST-free (March transition is the 29th), so it runs as a
+# single continuous segment. Widen again once per-room VAV control is added.
 eval_start: "2025-12-01"
-eval_end: "2026-05-15"
+eval_end: "2026-03-01"
 
 # Radiator nominal parameters (initial guess; refined by Stage 2)
 radiator:
@@ -79,10 +92,23 @@ radiator:
   TAir_nominal_sh: 21.0
   thermalMassHeatCapacity: 5000.0
 
-# ECL310 heating curve initial guess (refined by Stage 2)
+# ECL310 outdoor-reset heating curve: T_sup = b + s*(21 - T_oa) + delta.
+# FITTED to the building's measured supply-vs-outdoor relationship (least squares
+# over 20.5k heating-on BMS samples, T_sup>30 C: s=1.20, b=23.57; measured supply
+# mean 42 C, return 32 C — a low-temperature system). The earlier s=1.5/b=35
+# "Nordic default" commanded ~66 C at 0 C outdoor vs the ~49 C the building
+# actually used (~18 C too hot), which pinned the ECL310 mixing valve wide open
+# (shunt ceiling ~46-48 C at sim return temps) so the supply — and radiator
+# power — was stuck ~constant regardless of weather: the reset was inoperative
+# and zones drifted up through spring. See scripts/diag_curve_fit.py.
 heating_curve:
-  s: 1.5
-  b: 35.0
+  s: 1.2
+  b: 23.6
   delta: 0.0
   T_min: 20.0
   T_max: 80.0
+  # ECL310 room compensation: supply setpoint is trimmed by
+  # room_comp_k * (mean_room_temp - 21). Closes the room-temperature loop that
+  # the fixed-position radiator valves otherwise lack, so the baseline holds
+  # ~21 C instead of drifting up through spring. Used by baseline_eval.py.
+  room_comp_k: 4.0

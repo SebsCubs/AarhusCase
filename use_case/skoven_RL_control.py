@@ -3,8 +3,13 @@
 Trains a PPO agent on the Skoven T4B model to optimise district-heating
 consumption and thermal comfort, using measured reward signals.
 
-Reward: -(temp_violation_penalty * 10000 + heat_kW + 0.5 * ahu_W/1000) / 1000
-        returned as Δ from previous step (matching reference convention).
+Reward (direct, per-step cost — NOT a Δ):
+    reward = -(W_COMFORT * temp_violation + energy_penalty) / REWARD_SCALE
+where energy_penalty = (heat_kW + 0.5*ahu_kW) but ONLY while every room is in
+band (comfort floor / lexicographic-style): the agent is credited for saving
+energy only once comfort is satisfied, so it can't buy energy savings by
+starving heat. Direct (non-Δ) so the episodic return — and hence EvalCallback's
+best_model selection — is a monotone measure of policy quality.
 
 Usage:
     python use_case/skoven_RL_control.py           # train
@@ -27,8 +32,10 @@ from stable_baselines3.common.callbacks import (
 )
 from stable_baselines3.common.monitor import Monitor
 
-from t4b_gym.t4b_gym_env import T4BGymEnv, NormalizedObservationWrapper, NormalizedActionWrapper
-from aarhus_model.skoven_model import load_model_and_params, ZONES
+from t4b_gym.t4b_gym_env import (
+    T4BGymEnv, GymSimulator, NormalizedObservationWrapper, NormalizedActionWrapper,
+)
+from aarhus_model.skoven_model import load_model_and_params, ZONES, AHU_DEFAULTS
 from use_case.model_eval import test_model_chunked
 from use_case.rl_config import (
     TZ, POLICY_CONFIG_PATH, LOG_DIR, CHECKPOINT_DIR, STEP_SIZE, EPISODE_STEPS,
@@ -45,12 +52,78 @@ TRAIN_START, TRAIN_END, EVAL_START, EVAL_END = load_rl_windows()
 TRAIN_EXCLUDING_PERIODS = dst_excluding_periods(TRAIN_START, TRAIN_END, EPISODE_STEPS, STEP_SIZE)
 
 
+class EconomizerGymSimulator(GymSimulator):
+    """Plant-level AHU economizer (free cooling).
+
+    Each timestep, right after the AHU supply-air setpoint schedule steps — and
+    before the coil / heat-recovery read it (the schedule is a source, so it
+    steps first in the execution order) — override the setpoint with a free-
+    cooling value whenever the building runs above setpoint+deadband AND the
+    outdoor air is cooler. The AHU then supplies cool outdoor air (heat-recovery
+    bypass, since the same setpoint drives the HR target) down to a floor,
+    shedding the solar/internal gains the radiators can't remove.
+
+    This is a property of the PLANT, so it applies to both the rule-based
+    baseline and the RL rollouts; it is NOT an RL action (the agent still only
+    controls the hydronic supply setpoint). Room feedback uses the previous
+    step's zone temps (1-step delay), standard for a supervisory controller.
+    """
+
+    SETPOINT_COMPONENT = "supply_air_temp_setpoint_sensor"
+    ECON_TARGET = float(AHU_DEFAULTS["supply_air_setpoint_C"])
+    ECON_DEADBAND = float(AHU_DEFAULTS["economizer_deadband_C"])
+    ECON_GAIN = float(AHU_DEFAULTS["economizer_gain"])
+    ECON_MIN = float(AHU_DEFAULTS["cooling_min_supply_air_C"])
+    ECON_ENABLED = bool(AHU_DEFAULTS["economizer_enabled"])
+
+    def _economizer_setpoint(self) -> float:
+        m = self.model
+        temps = []
+        for z in ZONES:
+            comp = m.components.get(f"{z}_indoor_temp_sensor")
+            if comp is None:
+                continue
+            v = comp.output["measuredValue"].get()
+            if v is not None and np.isfinite(float(v)):
+                temps.append(float(v))
+        if not temps:
+            return self.ECON_TARGET
+        T_room = sum(temps) / len(temps)
+        T_oa = float(m.components["outdoor_environment"].output["outdoorTemperature"].get())
+        overshoot = T_room - self.ECON_TARGET
+        if np.isfinite(T_oa) and overshoot > self.ECON_DEADBAND and T_oa < T_room:
+            # Proportional free cooling: drop the supply-air setpoint below 21 in
+            # proportion to the mean-room overshoot (past the deadband), floored.
+            # Only free while the floor stays above outdoor temp (heat-recovery
+            # bypass); the coil trims the rest.
+            setpoint = self.ECON_TARGET - self.ECON_GAIN * (overshoot - self.ECON_DEADBAND)
+            return float(min(max(setpoint, self.ECON_MIN), self.ECON_TARGET))
+        return self.ECON_TARGET
+
+    def _do_component_timestep(self, component, second_time, date_time, step_size, step_index):
+        super()._do_component_timestep(component, second_time, date_time, step_size, step_index)
+        if (self.ECON_ENABLED and component.id == self.SETPOINT_COMPONENT
+                and "scheduleValue" in component.output):
+            val = self._economizer_setpoint()
+            out = component.output["scheduleValue"]
+            out._tensor[:] = val
+            if getattr(out, "_log_history", False):
+                out._history[step_index] = val
+
+
 class SkovenGymEnv(T4BGymEnv):
     """Custom reward for the Skoven hydronic building model."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.previous_objective = 0.0
+    simulator_class = EconomizerGymSimulator
+
+    # Reward weights. temp_violation already grows sharply (heating_viol +
+    # exp(heating_viol)-1, per zone), so W_COMFORT just sets how hard comfort
+    # dominates energy; LAMBDA_ENERGY weights the (gated) heat+AHU term in kW;
+    # REWARD_SCALE keeps the per-step reward O(1) for a well-conditioned value
+    # function.
+    W_COMFORT = 10.0
+    LAMBDA_ENERGY = 1.0
+    REWARD_SCALE = 10.0
 
     @staticmethod
     def _val(component, port, default=0.0):
@@ -83,8 +156,13 @@ class SkovenGymEnv(T4BGymEnv):
         for zone_id in ZONES:
             T_zone = self._val(model.components[f"{zone_id}_indoor_temp_sensor"], "measuredValue")
             heating_viol = max(0.0, (self.COMFORT_SETPOINT - self.COMFORT_DEADBAND) - T_zone)
-            temp_violation_total += heating_viol + np.exp(1 + heating_viol)
-        temp_penalty = 10000 * temp_violation_total
+            # Sharp, asymmetric comfort penalty that is exactly 0 when the room is
+            # comfortable. The earlier `exp(1 + heating_viol)` added a constant e¹
+            # per zone even at zero violation (a 4·e¹ = 10.873 floor), which made
+            # comfort_ok structurally impossible and swamped the energy terms so the
+            # agent just maxed heating. `exp(x) - 1` keeps the sharp growth on a real
+            # dip but vanishes at heating_viol = 0, restoring the energy signal.
+            temp_violation_total += heating_viol + (np.exp(heating_viol) - 1.0)
 
         # --- District heating power [kW] ---
         # In calibration mode a measured varme sensor exists; in simulation mode
@@ -103,13 +181,21 @@ class SkovenGymEnv(T4BGymEnv):
         if "supply_heating_coil" in model.components:
             ahu_W += self._val(model.components["supply_heating_coil"], "Power")
 
-        objective = -(temp_penalty + heat_kW + 0.5 * ahu_W / 1000.0) / 1000.0
+        # --- Comfort-floor reward (direct per-step cost, NOT a Δ) ---
+        # Energy is penalised ONLY when every room is in band, so the agent
+        # cannot lower the energy term by starving heat (that opens a comfort
+        # violation, whose penalty dominates and whose presence gates the
+        # energy credit off entirely). Once comfort is held, the only remaining
+        # gradient is to trim heat+AHU toward the comfort boundary.
+        comfort_penalty = self.W_COMFORT * temp_violation_total
+        energy_kW = heat_kW + 0.5 * ahu_W / 1000.0
+        comfort_ok = temp_violation_total <= 0.0
+        energy_penalty = self.LAMBDA_ENERGY * energy_kW if comfort_ok else 0.0
 
-        if np.isnan(objective):
+        reward = -(comfort_penalty + energy_penalty) / self.REWARD_SCALE
+
+        if np.isnan(reward):
             raise ValueError("Reward is NaN — check model outputs")
-
-        reward = -(objective - self.previous_objective)
-        self.previous_objective = objective
 
         # Stashed for the Monitor's info_keywords / TensorboardCallback (see
         # SkovenGymEnv.step below) — reported un-normalized so training curves
@@ -118,7 +204,7 @@ class SkovenGymEnv(T4BGymEnv):
             "heat_kW": float(heat_kW),
             "ahu_kW": float(ahu_W / 1000.0),
             "temp_violation": float(temp_violation_total),
-            "comfort_ok": float(temp_violation_total == 0.0),
+            "comfort_ok": float(comfort_ok),
         }
         return reward
 
@@ -169,6 +255,15 @@ class RewardTermsCallback(BaseCallback):
         return True
 
 
+def linear_schedule(initial_value: float, final_value: float = 0.0):
+    """Linear anneal from initial_value (progress_remaining=1) to final_value
+    (progress_remaining=0). Lets PPO take large early steps and settle late, so
+    the policy std actually contracts instead of staying pinned at its init."""
+    def schedule(progress_remaining: float) -> float:
+        return final_value + progress_remaining * (initial_value - final_value)
+    return schedule
+
+
 def train(reload: bool = False, total_timesteps: int = 500_000,
           checkpoint_freq: int = 25_000, eval_freq: int = 5_000):
     env = build_env(TRAIN_START, TRAIN_END, monitor_filename="monitor.csv",
@@ -182,11 +277,17 @@ def train(reload: bool = False, total_timesteps: int = 500_000,
         env,
         verbose=1,
         gamma=0.99,
-        learning_rate=1e-5,
-        batch_size=50,
-        n_steps=200,
+        # lr 3e-4 (PPO default) annealed to 0 — the previous 1e-5 was ~30x too
+        # low, so the policy std stayed pinned near its init for the whole 500k
+        # (under-converged, still wandering between the heat-starve and
+        # over-heat extremes). Anneal lets it settle late.
+        learning_rate=linear_schedule(3e-4),
+        n_steps=720,          # one full 5-day episode per rollout → cleaner GAE
+        batch_size=120,       # divides 720 evenly (6 minibatches)
         n_epochs=10,
+        gae_lambda=0.95,
         clip_range=0.2,
+        ent_coef=0.0,         # no entropy bonus — we WANT std to contract
         max_grad_norm=0.5,
         tensorboard_log=LOG_DIR,
         device="cpu",
@@ -198,7 +299,11 @@ def train(reload: bool = False, total_timesteps: int = 500_000,
             best_model_save_path=LOG_DIR,
             log_path=LOG_DIR,
             eval_freq=eval_freq,
-            n_eval_episodes=5,
+            # eval env is deterministic + fixed-start, so repeated episodes are
+            # identical — one is enough. best_model is now selected on the
+            # direct (non-Δ) episodic return, a real measure of policy quality.
+            n_eval_episodes=1,
+            deterministic=True,
         ),
         CheckpointCallback(
             save_freq=checkpoint_freq,
