@@ -4,12 +4,15 @@ Trains a PPO agent on the Skoven T4B model to optimise district-heating
 consumption and thermal comfort, using measured reward signals.
 
 Reward (direct, per-step cost — NOT a Δ):
-    reward = -(W_COMFORT * temp_violation + energy_penalty) / REWARD_SCALE
-where energy_penalty = (heat_kW + 0.5*ahu_kW) but ONLY while every room is in
-band (comfort floor / lexicographic-style): the agent is credited for saving
-energy only once comfort is satisfied, so it can't buy energy savings by
-starving heat. Direct (non-Δ) so the episodic return — and hence EvalCallback's
-best_model selection — is a monotone measure of policy quality.
+    reward = -(W_COMFORT*temp_violation + W_TARGET*temp_target_dev
+               + energy_penalty) / REWARD_SCALE
+where temp_target_dev = Σ_zones (T_z - 21)² pulls each room toward the 21 °C
+target (so the per-room setpoint actions carry a real gradient instead of the
+range-chatter the flat [19,26] band produced), temp_violation is a hard
+backstop for actually leaving [19,26], and energy_penalty = (heat_kW + ahu_kW)
+is credited ONLY while every room is in band (comfort floor) so the agent can't
+buy energy savings by starving heat. Direct (non-Δ) so the episodic return —
+and hence EvalCallback's best_model selection — is monotone in policy quality.
 
 Usage:
     python use_case/skoven_RL_control.py           # train
@@ -43,8 +46,8 @@ from aarhus_model.heating_curve import compute_supply_setpoint
 from use_case.model_eval import test_model_chunked
 from use_case.rl_config import (
     TZ, POLICY_CONFIG_PATH, LOG_DIR, CHECKPOINT_DIR, STEP_SIZE, EPISODE_STEPS,
-    COMFORT_MIN_C, COMFORT_MAX_C, load_rl_windows, dst_excluding_periods,
-    load_building_config,
+    COMFORT_MIN_C, COMFORT_MAX_C, COMFORT_SETPOINT_C, load_rl_windows,
+    dst_excluding_periods, load_building_config, window_step_count,
 )
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -224,14 +227,25 @@ class SkovenGymEnv(T4BGymEnv):
 
     simulator_class = SupervisorySetpointGymSimulator
 
-    # Reward weights. temp_violation already grows sharply (viol + exp(viol)-1,
-    # per zone, two-sided about the [19,26] band), so W_COMFORT just sets how hard
-    # comfort dominates energy; LAMBDA_ENERGY weights the (gated) heat+AHU term in
-    # kW; REWARD_SCALE keeps the per-step reward O(1) for a well-conditioned value
-    # function.
+    # Reward weights.
+    #  - W_COMFORT * temp_violation: HARD safety backstop for leaving the
+    #    [19,26] band (viol + exp(viol)-1, two-sided). Normally ~0 because the
+    #    target term below keeps rooms near 21, far from either edge.
+    #  - W_TARGET * temp_target_dev: NEW quadratic pull toward COMFORT_TARGET
+    #    (21 °C), summed over zones = Σ(T_z - 21)². The previous band-only
+    #    comfort term was flat everywhere inside a 7 °C-wide window, so the
+    #    per-room setpoint actions had NO gradient and collapsed to full-range
+    #    [18,26] chatter (only their mean mattered). A quadratic target gives
+    #    each room's setpoint a real gradient — including the per-room damper
+    #    trim lever (K_DAMPER·|Tset-Troom|), so a warmer setpoint on the cold
+    #    room now pays off.
+    #  - LAMBDA_ENERGY * energy_kW: heat+AHU in kW, gated on staying in band.
+    #  - REWARD_SCALE keeps the per-step reward O(1) for a conditioned value fn.
     W_COMFORT = 10.0
+    W_TARGET = 1.0
     LAMBDA_ENERGY = 1.0
     REWARD_SCALE = 10.0
+    COMFORT_TARGET = COMFORT_SETPOINT_C
 
     @staticmethod
     def _val(component, port, default=0.0):
@@ -266,10 +280,12 @@ class SkovenGymEnv(T4BGymEnv):
         # exactly 0 inside the band, so comfort_ok is reachable and the energy
         # signal survives (the fix that made comfort learnable in v3).
         temp_violation_total = 0.0
+        temp_target_dev = 0.0    # Σ_zones (T - COMFORT_TARGET)²  [°C²]
         for zone_id in ZONES:
             T_zone = self._val(model.components[f"{zone_id}_indoor_temp_sensor"], "measuredValue")
             viol = max(0.0, self.COMFORT_MIN - T_zone) + max(0.0, T_zone - self.COMFORT_MAX)
             temp_violation_total += viol + (np.exp(viol) - 1.0)
+            temp_target_dev += (T_zone - self.COMFORT_TARGET) ** 2
 
         # --- District heating power [kW] ---
         # In calibration mode a measured varme sensor exists; in simulation mode
@@ -294,8 +310,14 @@ class SkovenGymEnv(T4BGymEnv):
         # violation, whose penalty dominates and whose presence gates the
         # energy credit off entirely). Once comfort is held, the only remaining
         # gradient is to trim heat+AHU toward the comfort boundary.
-        comfort_penalty = self.W_COMFORT * temp_violation_total
-        energy_kW = heat_kW + 0.5 * ahu_W / 1000.0
+        comfort_penalty = (self.W_COMFORT * temp_violation_total
+                           + self.W_TARGET * temp_target_dev)
+        # AHU is weighted at 1.0 (true kWh), NOT discounted. A previous 0.5x
+        # discount let the agent game the reward by shifting load off the
+        # radiators (full cost) onto the AHU coil/fan (half cost) — real total
+        # energy rose (AHU ~2x baseline) while the reward fell. Both loops now
+        # cost their actual kW so the policy minimises real energy.
+        energy_kW = heat_kW + ahu_W / 1000.0
         comfort_ok = temp_violation_total <= 0.0
         energy_penalty = self.LAMBDA_ENERGY * energy_kW if comfort_ok else 0.0
 
@@ -311,6 +333,7 @@ class SkovenGymEnv(T4BGymEnv):
             "heat_kW": float(heat_kW),
             "ahu_kW": float(ahu_W / 1000.0),
             "temp_violation": float(temp_violation_total),
+            "temp_dev": float(np.sqrt(temp_target_dev / len(ZONES))),  # RMS °C from 21
             "comfort_ok": float(comfort_ok),
         }
         return reward
@@ -321,17 +344,18 @@ class SkovenGymEnv(T4BGymEnv):
         return obs, reward, terminated, truncated, info
 
 
-REWARD_INFO_KEYS = ("heat_kW", "ahu_kW", "temp_violation", "comfort_ok")
+REWARD_INFO_KEYS = ("heat_kW", "ahu_kW", "temp_violation", "temp_dev", "comfort_ok")
 
 
-def build_env(start, end, eval_mode=False, monitor_filename="monitor.csv", excluding_periods=None):
+def build_env(start, end, eval_mode=False, monitor_filename="monitor.csv",
+              excluding_periods=None, episode_length=EPISODE_STEPS):
     model = load_model_and_params()
     env = SkovenGymEnv(
         model=model,
         io_config_file=POLICY_CONFIG_PATH,
         start_time=start,
         end_time=end,
-        episode_length=EPISODE_STEPS,
+        episode_length=episode_length,
         random_start=not eval_mode,
         excluding_periods=excluding_periods,
         forecast_horizon=50,
@@ -372,12 +396,22 @@ def linear_schedule(initial_value: float, final_value: float = 0.0):
 
 
 def train(reload: bool = False, total_timesteps: int = 500_000,
-          checkpoint_freq: int = 25_000, eval_freq: int = 5_000):
+          checkpoint_freq: int = 25_000, eval_freq: int = 25_000):
     env = build_env(TRAIN_START, TRAIN_END, monitor_filename="monitor.csv",
                      excluding_periods=TRAIN_EXCLUDING_PERIODS)
     # Held-out eval env on the disjoint EVAL window (not the training window),
-    # so best_model.zip is selected on out-of-sample data.
-    eval_env = build_env(EVAL_START, EVAL_END, eval_mode=True, monitor_filename="eval_monitor.csv")
+    # so best_model.zip is selected on out-of-sample data. The eval EPISODE
+    # spans the FULL winter window (not a single 5-day slice): the previous
+    # 5-day eval episode started at EVAL_START (Dec 1-6, a mild spell), so
+    # best_model was picked on weather unrepresentative of the season and
+    # overfit to it. A full-window episode selects on the same span the final
+    # `--compare` scores. The winter window is DST-free (one continuous
+    # segment) so a single long episode is safe; eval_freq is raised to 25k
+    # to keep the (now ~90-day) eval episodes from dominating wall-clock.
+    eval_steps = window_step_count(EVAL_START, EVAL_END, STEP_SIZE)
+    eval_env = build_env(EVAL_START, EVAL_END, eval_mode=True,
+                          monitor_filename="eval_monitor.csv",
+                          episode_length=eval_steps)
 
     ppo_model = PPO(
         "MlpPolicy",
@@ -469,7 +503,9 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true", help="10-step gym/PPO smoke test")
     parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--checkpoint-freq", type=int, default=25_000)
-    parser.add_argument("--eval-freq", type=int, default=5_000)
+    # 25k (not 5k): the eval episode now spans the full ~90-day winter, so
+    # each eval is ~2.5 min — evaluating every 5k steps would dominate wall-clock.
+    parser.add_argument("--eval-freq", type=int, default=25_000)
     args = parser.parse_args()
 
     if args.smoke:

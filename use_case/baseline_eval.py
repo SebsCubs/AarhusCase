@@ -151,21 +151,26 @@ def compare():
     _, rl_kpis = test_model_chunked(env, ppo_model, plots_dir=PLOTS_DIR)
 
     print("\n=== RL vs. baseline ===")
+    # mode: "pct" -> "% saved" (lower better, energy/viol); "pp" -> percentage
+    # points (higher better, % in band); "degC" -> absolute °C delta (lower
+    # better, RMSE-to-target — a fraction of a % is meaningless for a temperature).
     rows = [
-        ("heating_energy_kWh", "Heating energy (kWh)", True),
-        ("ahu_energy_kWh", "AHU energy (kWh)", True),
-        ("comfort_degree_hours", "Comfort viol. (degC*h)", True),
-        ("comfort_pct_in_band", "Time in comfort band (%)", False),
+        ("heating_energy_kWh", "Heating energy (kWh)", "pct"),
+        ("ahu_energy_kWh", "AHU energy (kWh)", "pct"),
+        ("comfort_degree_hours", "Comfort viol. (degC*h)", "pct"),
+        ("comfort_pct_in_band", "Time in comfort band (%)", "pp"),
+        ("comfort_rmse_target", "Temp RMSE vs 21degC (degC)", "degC"),
     ]
-    print(f"{'metric':28s}{'baseline':>14s}{'RL':>14s}{'change':>12s}")
-    for key, label, lower_is_better in rows:
+    print(f"{'metric':28s}{'baseline':>14s}{'RL':>14s}{'change':>16s}")
+    for key, label, mode in rows:
         b, r = baseline_kpis[key], rl_kpis[key]
-        if lower_is_better:
+        if mode == "pct":
             change = 100.0 * (b - r) / b if b != 0 else float("nan")
             change_str = f"{change:+.1f}% saved"
-        else:
-            change = r - b
-            change_str = f"{change:+.1f} pp"
+        elif mode == "pp":
+            change_str = f"{r - b:+.1f} pp"
+        else:  # degC — absolute delta, negative = closer to target
+            change_str = f"{r - b:+.2f} degC"
         print(f"{label:28s}{b:14.2f}{r:14.2f}{change_str:>16s}")
 
     heating_ok = rl_kpis["heating_energy_kWh"] <= baseline_kpis["heating_energy_kWh"]

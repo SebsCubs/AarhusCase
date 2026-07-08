@@ -223,21 +223,31 @@ def plot_results(simulator: tb.Simulator, rewards=None, plotting_stepSize=600,
             plt.savefig(os.path.join(plots_dir, f"{zone_id}_temperature_setpoint.png"))
         plt.close()
 
-    # --- Comfort KPIs: two-sided degree-hours outside [MIN,MAX], % time in band ---
+    # --- Comfort KPIs: two-sided degree-hours outside [MIN,MAX], % time in band,
+    #     and RMSE from the COMFORT_SETPOINT_C (21 °C) target. The RMSE-to-target
+    #     is what the deviation-from-target reward term optimises, so it makes the
+    #     RL-vs-baseline comparison meaningful on the tight-comfort objective (the
+    #     band KPIs alone read 100%/0 for anything inside the wide window). ---
     print("\n--- Comfort KPIs ---")
     total_degree_hours = 0.0
     total_in_band_frac = []
+    zone_rmse_target = []
     for zone_id, T in zone_temp_raw.items():
         viol_degC = np.maximum(0.0, COMFORT_MIN_C - T) + np.maximum(0.0, T - COMFORT_MAX_C)
         degree_hours = float(np.sum(viol_degC) * dt_hours)
         in_band_pct = float(np.mean((T >= COMFORT_MIN_C) & (T <= COMFORT_MAX_C)) * 100.0)
+        rmse_target = float(np.sqrt(np.mean((T - COMFORT_SETPOINT_C) ** 2)))
         total_degree_hours += degree_hours
         total_in_band_frac.append(in_band_pct)
+        zone_rmse_target.append(rmse_target)
         print(f"  {zone_id}: {degree_hours:8.2f} °C·h outside "
               f"[{COMFORT_MIN_C:.0f},{COMFORT_MAX_C:.0f}]°C, "
-              f"{in_band_pct:5.1f}% of timesteps in band")
+              f"{in_band_pct:5.1f}% in band, "
+              f"RMSE→{COMFORT_SETPOINT_C:.0f}°C = {rmse_target:4.2f} °C")
+    mean_rmse_target = float(np.mean(zone_rmse_target))
     print(f"  TOTAL: {total_degree_hours:8.2f} °C·h, "
-          f"{np.mean(total_in_band_frac):5.1f}% mean time in band")
+          f"{np.mean(total_in_band_frac):5.1f}% mean time in band, "
+          f"mean RMSE→{COMFORT_SETPOINT_C:.0f}°C = {mean_rmse_target:4.2f} °C")
 
     # --- Hydronic energy — sum of per-radiator Power ---
     total_radiator_power = None
@@ -365,6 +375,7 @@ def plot_results(simulator: tb.Simulator, rewards=None, plotting_stepSize=600,
         "ahu_energy_kWh": ahu_energy_kWh,
         "comfort_degree_hours": total_degree_hours,
         "comfort_pct_in_band": float(np.mean(total_in_band_frac)),
+        "comfort_rmse_target": mean_rmse_target,
     }
 
 

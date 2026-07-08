@@ -117,3 +117,15 @@ def dst_excluding_periods(start: datetime.datetime, end: datetime.datetime,
         (instant - episode_span, instant + datetime.timedelta(days=1))
         for instant in dst_transition_instants(start, end)
     ]
+
+
+def window_step_count(start: datetime.datetime, end: datetime.datetime,
+                       step_size: int) -> int:
+    """Number of `step_size`-second steps spanning [start, end), computed
+    DST-safely: summed over dst_safe_chunks so no elapsed-time subtraction
+    ever crosses a transition (which dateutil's singleton tzinfo would get
+    wrong — see the note above). Used to size a full-window eval episode."""
+    return sum(
+        int(round((b - a).total_seconds() / step_size))
+        for a, b in dst_safe_chunks(start, end)
+    )
